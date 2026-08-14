@@ -1,0 +1,10 @@
+{
+  "name": "Koin 个人消费账本",
+  "short_name": "Koin",
+  "description": "看清每个月的钱花在哪里",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f1ea",
+  "theme_color": "#6f55c8",
+  "lang": "zh-CN"
+}
