@@ -27,6 +27,7 @@ test("server-renders the Koin application shell", async () => {
 
 test("includes source tracking and period CSV export", async () => {
   const app = await readFile(new URL("../app/KoinApp.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   assert.match(app, /账目来源/);
   assert.match(app, /导出期间账单/);
   assert.match(app, /本周/);
@@ -50,4 +51,13 @@ test("includes source tracking and period CSV export", async () => {
   assert.doesNotMatch(app, /note: `导入行/);
   assert.match(app, /dailySpendLevel/);
   assert.match(app, /¥500\+/);
+  assert.match(app, /消费分区/);
+  assert.match(app, /CategoryOrganizer/);
+  assert.match(app, /draggable/);
+  assert.match(app, /拖动账目到其他分区/);
+  assert.match(app, /游戏/);
+  assert.match(app, /生活/);
+  assert.match(css, /\.view-heading h1[^}]*Microsoft YaHei UI/);
+  assert.match(css, /\.stat-row strong[^}]*font-variant-numeric:tabular-nums/);
+  assert.match(css, /\.rank b[^}]*Microsoft YaHei UI/);
 });

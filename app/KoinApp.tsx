@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
 type Kind = "expense" | "refund" | "income" | "transfer";
@@ -20,8 +20,10 @@ type Transaction = {
 const STORE_KEY = "koin.transactions.v1";
 const CATEGORY_COLORS: Record<string, string> = {
   餐饮: "#ef825f",
+  生活: "#6f9a85",
   购物: "#7559d9",
   交通: "#43a68b",
+  游戏: "#9a65cf",
   娱乐: "#e9b949",
   居住: "#497cc4",
   医疗: "#dc6683",
@@ -98,7 +100,9 @@ function classify(merchant: string) {
   if (/地铁|公交|滴滴|出行|打车|铁路|航空|加油/.test(text)) return "交通";
   if (/药|医院|诊所|医疗/.test(text)) return "医疗";
   if (/房租|物业|水费|电费|燃气/.test(text)) return "居住";
-  if (/会员|电影|游戏|抖音|音乐/.test(text)) return "娱乐";
+  if (/游戏|steam|playstation|xbox|任天堂|米哈游|腾讯游戏/.test(text)) return "游戏";
+  if (/会员|电影|抖音|音乐|演出/.test(text)) return "娱乐";
+  if (/日用|便利店|洗衣|理发|清洁|快递/.test(text)) return "生活";
   if (/书|课程|教育|培训/.test(text)) return "学习";
   if (/超市|商城|淘宝|京东|拼多多|商店/.test(text)) return "购物";
   return "其他";
@@ -171,6 +175,11 @@ export default function KoinApp() {
     setToast(editing ? "记录已更新" : "已记入本月消费");
   }
 
+  function moveTransactionToCategory(id: string, category: string) {
+    setTransactions((current) => current.map((item) => item.id === id ? { ...item, category } : item));
+    setToast(`已移入“${category}”分区`);
+  }
+
   function openEditor(item?: Transaction, amount?: number) {
     setEditing(item ?? null);
     setDraftAmount(amount);
@@ -227,6 +236,7 @@ export default function KoinApp() {
                 <section className="panel trend-panel"><PanelTitle title="每日消费" subtitle="颜色越暖，当日消费越高" /><div className="spend-legend" aria-label="每日消费颜色分级"><span><i className="low" />¥1–49</span><span><i className="regular" />¥50–199</span><span><i className="high" />¥200–499</span><span><i className="peak" />¥500+</span></div><div className="bars" aria-label="每日消费柱状图">{daily.map((item) => <div className="bar-slot" key={item.date} title={`${item.date}：¥${money(item.amount)}`}><span className={`bar ${dailySpendLevel(item.amount)}`} style={{ height: `${Math.max(item.amount ? 8 : 2, item.amount / maxDaily * 100)}%` }} /></div>)}</div><div className="axis"><span>{rangeStart.slice(5)}</span><span>{daily[Math.floor(daily.length / 2)]?.date.slice(5) ?? ""}</span><span>{rangeEnd.slice(5)}</span></div></section>
                 <section className="panel category-panel"><PanelTitle title="消费分类" subtitle="按订单用途统计" /><CategoryRing items={categoryTotals} total={total} /></section>
               </div>
+              <CategoryOrganizer items={expenses} onMove={moveTransactionToCategory} onOpen={openEditor} />
               <RecordsPanel items={visible} onOpen={openEditor} limit={6} />
             </>}
           </>}
@@ -303,6 +313,72 @@ function CategoryRing({ items, total }: { items: { category: string; amount: num
   let cursor = 0;
   const stops = items.map((item) => { const start = cursor; cursor += item.amount / Math.max(total, 1) * 100; return `${CATEGORY_COLORS[item.category]} ${start}% ${cursor}%`; }).join(",");
   return <div className="category-content"><div className="donut" style={{ background: `conic-gradient(${stops})` }}><div><span>最高分类</span><strong>{items[0].category}</strong></div></div><div className="legend">{items.slice(0, 4).map((item) => <div key={item.category}><span className="dot" style={{ background: CATEGORY_COLORS[item.category] }} /><span>{item.category}</span><strong>¥{money(item.amount)}</strong></div>)}</div></div>;
+}
+
+function CategoryOrganizer({ items, onMove, onOpen }: { items: Transaction[]; onMove: (id: string, category: string) => void; onOpen: (item: Transaction) => void }) {
+  const categoriesWithItems = CATEGORIES.filter((category) => items.some((item) => item.category === category));
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(categoriesWithItems.slice(0, 3)));
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const groups = useMemo(() => CATEGORIES.map((category) => {
+    const records = items.filter((item) => item.category === category).sort((a, b) => b.date.localeCompare(a.date));
+    return { category, records, total: records.reduce((sum, item) => sum + item.amount, 0) };
+  }), [items]);
+
+  function toggle(category: string) {
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(category)) next.delete(category); else next.add(category);
+      return next;
+    });
+  }
+
+  function drop(event: DragEvent<HTMLElement>, category: string) {
+    event.preventDefault();
+    const id = event.dataTransfer.getData("text/plain") || draggingId;
+    if (id) onMove(id, category);
+    setExpanded((current) => new Set(current).add(category));
+    setDraggingId(null);
+    setDropTarget(null);
+  }
+
+  return <section className="panel category-organizer">
+    <div className="organizer-heading"><div><h2>消费分区</h2><p>拖动账目到其他分区；手机上可直接选择分类</p></div><span>共 {items.length} 笔消费</span></div>
+    <div className="category-board">
+      {groups.map(({ category, records, total }) => {
+        const open = expanded.has(category);
+        return <section
+          className={`category-bucket${dropTarget === category ? " drop-target" : ""}`}
+          key={category}
+          onDragEnter={(event) => { event.preventDefault(); setDropTarget(category); }}
+          onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(category); }}
+          onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTarget(null); }}
+          onDrop={(event) => drop(event, category)}
+        >
+          <button className="bucket-toggle" onClick={() => toggle(category)} aria-expanded={open}>
+            <span className="bucket-color" style={{ background: CATEGORY_COLORS[category] }} />
+            <span><strong>{category}</strong><small>{records.length} 笔</small></span>
+            <b>¥{money(total)}</b>
+            <i aria-hidden="true">{open ? "⌃" : "⌄"}</i>
+          </button>
+          {open && <div className="bucket-records">
+            {records.length ? records.map((item) => <article
+              className={`bucket-record${draggingId === item.id ? " dragging" : ""}`}
+              draggable
+              key={item.id}
+              onDragStart={(event) => { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", item.id); setDraggingId(item.id); }}
+              onDragEnd={() => { setDraggingId(null); setDropTarget(null); }}
+            >
+              <span className="drag-handle" title="拖动到其他分区" aria-hidden="true">⠿</span>
+              <button className="bucket-record-main" onClick={() => onOpen(item)}><strong>{item.merchant}</strong><small>{Number(item.date.slice(5, 7))} 月 {Number(item.date.slice(8, 10))} 日 · {item.source}</small></button>
+              <b className="bucket-amount">¥{money(item.amount)}</b>
+              <label><span className="sr-only">将 {item.merchant} 移动到分类</span><select aria-label={`将 ${item.merchant} 移动到分类`} value={item.category} onChange={(event) => onMove(item.id, event.target.value)}>{CATEGORIES.map((option) => <option key={option}>{option}</option>)}</select></label>
+            </article>) : <div className="bucket-empty">拖到这里即可归类</div>}
+          </div>}
+        </section>;
+      })}
+    </div>
+  </section>;
 }
 
 function RecordsPanel({ items, onOpen, limit }: { items: Transaction[]; onOpen: (item: Transaction) => void; limit?: number }) {
