@@ -1,9 +1,19 @@
-"use client";
-
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
-type Kind = "expense" | "refund" | "income" | "transfer";
+type Kind = "expense" | "refund" | "income" | "repayment" | "transfer";
+type MatchStatus = "single" | "linked" | "review" | "excluded";
+type Evidence = {
+  id: string;
+  date: string;
+  merchant: string;
+  amount: number;
+  source: string;
+  payment: string;
+  fundingAccount: string;
+  kind: Kind;
+  orderId?: string;
+};
 type Transaction = {
   id: string;
   date: string;
@@ -13,8 +23,24 @@ type Transaction = {
   payment: string;
   source: string;
   kind: Kind;
+  fundingAccount?: string;
+  evidence?: Evidence[];
+  matchStatus?: MatchStatus;
+  possibleMatchId?: string;
+  counted?: boolean;
   orderId?: string;
   note?: string;
+};
+
+type ImportPlan = {
+  transactions: Transaction[];
+  preview: Transaction[];
+  imported: number;
+  added: number;
+  linked: number;
+  excluded: number;
+  review: number;
+  skipped: number;
 };
 
 const STORE_KEY = "koin.transactions.v1";
@@ -43,6 +69,164 @@ function money(value: number) {
 function cleanImportedNote(note?: string) {
   const cleaned = note?.replace(/^导入行\s*\d+\s*(?:[·•｜|—-]\s*)?/, "").trim();
   return cleaned || undefined;
+}
+
+const GENERIC_PRODUCT_NOTES = /^(?:消费|支付订单(?:\(.*\))?|付款码支付(?:[—-]+购买商品)?|网上快捷支付|扫码支付|收钱码收款|收款方备注[:：]?二维码收款|先用后付|先骑后付|京东-订单编号|订单编号[:：]?|tradeDesc)$/i;
+
+function transactionDisplay(item: Pick<Transaction, "merchant" | "note" | "kind">) {
+  const note = cleanImportedNote(item.note);
+  const product = (item.kind === "expense" || item.kind === "refund") && note && !GENERIC_PRODUCT_NOTES.test(note) ? note : undefined;
+  return {
+    primary: product ?? item.merchant,
+    merchant: product && product !== item.merchant ? item.merchant : undefined,
+    note: product ? undefined : note,
+  };
+}
+
+function detectSource(sourceHint: string) {
+  if (/微信|财付通/.test(sourceHint)) return "微信";
+  if (/支付宝/.test(sourceHint)) return "支付宝";
+  if (/美团月付/.test(sourceHint)) return "美团月付";
+  if (/抖音月付/.test(sourceHint)) return "抖音月付";
+  if (/抖音/.test(sourceHint)) return "抖音";
+  if (/美团/.test(sourceHint)) return "美团";
+  if (/京东|白条/.test(sourceHint)) return "京东";
+  if (/银行|银行卡|信用卡|储蓄卡|招商|工商|建设|农业|邮储|浦发|中信|民生|平安|广发|光大/.test(sourceHint)) return "银行卡";
+  return "账单导入";
+}
+
+function normalizePaymentChannel(payment: string, source: string, text = "") {
+  const combined = `${payment} ${text}`;
+  if (/微信|财付通/.test(combined) || source === "微信") return "微信支付";
+  if (/支付宝/.test(combined) || source === "支付宝") return "支付宝";
+  if (/美团月付/.test(combined) || source === "美团月付") return "美团月付";
+  if (/抖音月付/.test(combined) || source === "抖音月付") return "抖音月付";
+  if (/白条/.test(combined)) return "京东白条";
+  if (/银行卡|信用卡|储蓄卡|银联/.test(combined) || source === "银行卡") return "银行卡";
+  return payment || source;
+}
+
+function inferFundingAccount(payment: string, source: string, text = "") {
+  const combined = `${payment} ${text}`;
+  const monthly = combined.match(/花呗|京东白条|白条|美团月付|抖音月付/);
+  if (monthly) return monthly[0] === "白条" ? "京东白条" : monthly[0];
+  const card = combined.match(/(?:招商|工商|建设|农业|中国|交通|邮储|浦发|中信|民生|平安|广发|光大)?(?:银行)?(?:信用卡|储蓄卡|银行卡)(?:\([^)]*\)|尾号\d+)?/);
+  if (card) return card[0];
+  if (/零钱/.test(combined)) return "微信零钱";
+  if (/支付宝余额|余额宝/.test(combined)) return "支付宝余额";
+  if (source === "银行卡") return "银行卡";
+  return "未识别";
+}
+
+function inferKind(text: string, flow = ""): Kind {
+  if (/退款|退回|退货/.test(text)) return "refund";
+  if (/还款|偿还|自动扣款.*(?:花呗|白条|月付|信用卡)/.test(text)) return "repayment";
+  if (/收入|收款/.test(flow) || /收益到账|工资|利息收入/.test(text)) return "income";
+  if (/不计收支|中性/.test(flow) || /转账|提现|充值|账户互转|零钱通存取|理财申购|理财赎回/.test(text)) return "transfer";
+  return "expense";
+}
+
+function kindLabel(kind: Kind) {
+  return ({ expense: "消费", refund: "退款", income: "收入", repayment: "还款", transfer: "转账/不计" } as Record<Kind, string>)[kind];
+}
+
+function evidenceFrom(item: Transaction): Evidence {
+  return { id: crypto.randomUUID(), date: item.date, merchant: item.merchant, amount: item.amount, source: item.source, payment: item.payment, fundingAccount: item.fundingAccount ?? inferFundingAccount(item.payment, item.source, item.merchant), kind: item.kind, orderId: item.orderId };
+}
+
+function rawEvidenceKey(item: Evidence) {
+  if (item.orderId) return `${item.source}|${item.orderId}|${item.kind}`;
+  return `${item.source}|${item.date}|${item.merchant.replace(/\s/g, "").toLowerCase()}|${item.amount.toFixed(2)}|${item.kind}`;
+}
+
+function normalizeTransaction(item: Transaction): Transaction {
+  const fundingAccount = item.fundingAccount ?? inferFundingAccount(item.payment, item.source, `${item.merchant} ${item.note ?? ""}`);
+  const kind = item.kind === "transfer" && /还款|偿还/.test(`${item.merchant} ${item.note ?? ""}`) ? "repayment" : item.kind;
+  const excluded = kind === "repayment" || kind === "transfer";
+  const base: Transaction = { ...item, fundingAccount, kind, counted: excluded || item.matchStatus === "review" ? false : item.counted ?? true, matchStatus: item.matchStatus ?? (excluded ? "excluded" : "single") };
+  return { ...base, evidence: item.evidence?.length ? item.evidence : [evidenceFrom(base)] };
+}
+
+function sourceLayer(source: string) {
+  if (source === "银行卡") return 3;
+  if (/微信|支付宝|美团月付|抖音月付|花呗|白条/.test(source)) return 2;
+  if (/美团|抖音|京东|淘宝/.test(source)) return 1;
+  return 0;
+}
+
+function dateDistance(left: string, right: string) {
+  return Math.abs(parseDate(left).getTime() - parseDate(right).getTime()) / 86400000;
+}
+
+function channelRelated(left: Transaction, right: Transaction) {
+  const text = `${left.source} ${left.payment} ${left.fundingAccount} ${left.merchant} ${right.source} ${right.payment} ${right.fundingAccount} ${right.merchant}`;
+  const sourceBridge = ["微信", "支付宝", "美团", "抖音", "京东"].some((channel) => (left.source.includes(channel) && `${right.payment} ${right.merchant}`.includes(channel)) || (right.source.includes(channel) && `${left.payment} ${left.merchant}`.includes(channel)));
+  const bankBridge = (left.source === "银行卡" || right.source === "银行卡") && /微信|财付通|支付宝|美团|抖音|京东/.test(text);
+  return sourceBridge || bankBridge;
+}
+
+function sameEconomicEvent(left: Transaction, right: Transaction) {
+  if (left.kind !== right.kind || Math.abs(left.amount - right.amount) > 0.005) return false;
+  if (left.orderId && right.orderId && left.orderId === right.orderId) return true;
+  return left.source !== right.source && dateDistance(left.date, right.date) <= 2 && sourceLayer(left.source) !== sourceLayer(right.source) && channelRelated(left, right);
+}
+
+function possibleEconomicEvent(left: Transaction, right: Transaction) {
+  return left.kind === right.kind && left.source !== right.source && sourceLayer(left.source) !== sourceLayer(right.source) && Math.abs(left.amount - right.amount) <= 0.005 && dateDistance(left.date, right.date) <= 1;
+}
+
+function mergeTransactions(current: Transaction, incoming: Transaction): Transaction {
+  const evidence = [...(current.evidence ?? [evidenceFrom(current)]), ...(incoming.evidence ?? [evidenceFrom(incoming)])].filter((item, index, all) => all.findIndex((candidate) => rawEvidenceKey(candidate) === rawEvidenceKey(item)) === index);
+  const currentLayer = sourceLayer(current.source);
+  const incomingLayer = sourceLayer(incoming.source);
+  const incomingIsBetterDescription = incomingLayer > 0 && (currentLayer === 0 || incomingLayer < currentLayer);
+  return {
+    ...current,
+    merchant: incomingIsBetterDescription ? incoming.merchant : current.merchant,
+    source: incomingIsBetterDescription ? incoming.source : current.source,
+    payment: current.payment === current.source ? incoming.payment : current.payment,
+    fundingAccount: current.fundingAccount === "未识别" ? incoming.fundingAccount : current.fundingAccount,
+    category: current.category === "其他" ? incoming.category : current.category,
+    orderId: current.orderId ?? incoming.orderId,
+    note: current.note ?? incoming.note,
+    evidence,
+    counted: true,
+    matchStatus: "linked",
+    possibleMatchId: undefined,
+  };
+}
+
+function buildImportPlan(existing: Transaction[], incoming: Transaction[]): ImportPlan {
+  const transactions = existing.map(normalizeTransaction);
+  const known = new Set(transactions.flatMap((item) => (item.evidence ?? []).map(rawEvidenceKey)));
+  const preview: Transaction[] = [];
+  let added = 0; let linked = 0; let excluded = 0; let review = 0; let skipped = 0;
+  for (const raw of incoming) {
+    const item = normalizeTransaction(raw);
+    const evidence = item.evidence?.[0] ?? evidenceFrom(item);
+    const key = rawEvidenceKey(evidence);
+    if (known.has(key)) { skipped++; continue; }
+    known.add(key);
+    if (item.matchStatus === "review" && item.counted === false) {
+      transactions.push(item); preview.push(item); review++; continue;
+    }
+    if (item.kind === "repayment" || item.kind === "transfer") {
+      const excludedItem = { ...item, counted: false, matchStatus: "excluded" as MatchStatus };
+      transactions.push(excludedItem); preview.push(excludedItem); excluded++; continue;
+    }
+    const exactIndex = transactions.findIndex((candidate) => candidate.counted !== false && sameEconomicEvent(candidate, item));
+    if (exactIndex >= 0) {
+      transactions[exactIndex] = mergeTransactions(transactions[exactIndex], item);
+      preview.push({ ...item, counted: false, matchStatus: "linked" }); linked++; continue;
+    }
+    const possible = transactions.find((candidate) => candidate.counted !== false && possibleEconomicEvent(candidate, item));
+    if (possible) {
+      const reviewItem = { ...item, counted: false, matchStatus: "review" as MatchStatus, possibleMatchId: possible.id };
+      transactions.push(reviewItem); preview.push(reviewItem); review++; continue;
+    }
+    transactions.push(item); preview.push(item); added++;
+  }
+  return { transactions, preview, imported: preview.length, added, linked, excluded, review, skipped };
 }
 
 function dailySpendLevel(amount: number) {
@@ -109,7 +293,7 @@ function classify(merchant: string) {
 }
 
 function Icon({ name }: { name: string }) {
-  const icons: Record<string, string> = { home: "⌂", list: "≡", chart: "⌁", settings: "⚙", plus: "+", lock: "●", upload: "↥", back: "‹", next: "›", wallet: "◒", close: "×", download: "↓" };
+  const icons: Record<string, string> = { home: "⌂", list: "≡", link: "⇄", chart: "⌁", settings: "⚙", plus: "+", lock: "●", upload: "↥", back: "‹", next: "›", wallet: "◒", close: "×", download: "↓" };
   return <span aria-hidden="true">{icons[name] ?? "·"}</span>;
 }
 
@@ -119,7 +303,7 @@ export default function KoinApp() {
   const [rangeStart, setRangeStart] = useState(startOfCurrentMonth());
   const [rangeEnd, setRangeEnd] = useState(dateValue());
   const [periodOpen, setPeriodOpen] = useState(false);
-  const [view, setView] = useState<"overview" | "records" | "insights" | "settings">("overview");
+  const [view, setView] = useState<"overview" | "records" | "reconcile" | "insights" | "settings">("overview");
   const [editorOpen, setEditorOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -132,12 +316,11 @@ export default function KoinApp() {
     try {
       const saved = localStorage.getItem(STORE_KEY);
       const parsed: Transaction[] = saved ? JSON.parse(saved) : [];
-      setTransactions(parsed.filter((item) => !item.id.startsWith("demo-")).map((item) => ({ ...item, note: cleanImportedNote(item.note) })));
+      setTransactions(parsed.filter((item) => !item.id.startsWith("demo-")).map((item) => normalizeTransaction({ ...item, note: cleanImportedNote(item.note) })));
     } catch {
       setTransactions([]);
     }
     setLoaded(true);
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -151,8 +334,8 @@ export default function KoinApp() {
   }, [toast]);
 
   const visible = useMemo(() => transactions.filter((item) => item.date >= rangeStart && item.date <= rangeEnd), [transactions, rangeStart, rangeEnd]);
-  const expenses = visible.filter((item) => item.kind === "expense");
-  const refunds = visible.filter((item) => item.kind === "refund");
+  const expenses = visible.filter((item) => item.kind === "expense" && item.counted !== false);
+  const refunds = visible.filter((item) => item.kind === "refund" && item.counted !== false);
   const total = Math.max(0, expenses.reduce((sum, item) => sum + item.amount, 0) - refunds.reduce((sum, item) => sum + item.amount, 0));
   const categoryTotals = useMemo(() => CATEGORIES.map((category) => ({ category, amount: expenses.filter((item) => item.category === category).reduce((sum, item) => sum + item.amount, 0) })).filter((item) => item.amount > 0).sort((a, b) => b.amount - a.amount), [expenses]);
   const daily = useMemo(() => {
@@ -169,7 +352,8 @@ export default function KoinApp() {
   }
 
   function saveTransaction(item: Transaction) {
-    setTransactions((current) => editing ? current.map((old) => old.id === item.id ? item : old) : [item, ...current]);
+    const normalized = normalizeTransaction(item);
+    setTransactions((current) => editing ? current.map((old) => old.id === item.id ? normalized : old) : [normalized, ...current]);
     setEditorOpen(false);
     setEditing(null);
     setToast(editing ? "记录已更新" : "已记入本月消费");
@@ -193,10 +377,29 @@ export default function KoinApp() {
     setToast("记录已删除");
   }
 
-  function completeImport(items: Transaction[], skipped: number) {
-    setTransactions((current) => [...items.map((item) => ({ ...item, note: cleanImportedNote(item.note) })), ...current]);
+  function completeImport(plan: ImportPlan) {
+    setTransactions(plan.transactions);
     setImportOpen(false);
-    setToast(`已导入 ${items.length} 笔${skipped ? `，跳过 ${skipped} 笔重复` : ""}`);
+    setToast(`已读取 ${plan.imported} 条流水，关联 ${plan.linked} 条，待确认 ${plan.review} 条`);
+  }
+
+  function confirmMatch(candidateId: string) {
+    setTransactions((current) => {
+      const candidate = current.find((item) => item.id === candidateId);
+      if (!candidate?.possibleMatchId) return current;
+      const targetIndex = current.findIndex((item) => item.id === candidate.possibleMatchId);
+      if (targetIndex < 0) return current;
+      const next = current.filter((item) => item.id !== candidateId);
+      const adjustedIndex = next.findIndex((item) => item.id === current[targetIndex].id);
+      next[adjustedIndex] = mergeTransactions(next[adjustedIndex], { ...candidate, counted: true, matchStatus: "single", possibleMatchId: undefined });
+      return next;
+    });
+    setToast("两条流水已合并为一笔消费");
+  }
+
+  function keepSeparate(candidateId: string) {
+    setTransactions((current) => current.map((item) => item.id === candidateId ? { ...item, counted: true, matchStatus: "single", possibleMatchId: undefined } : item));
+    setToast("已保留为两笔独立记录");
   }
 
   return (
@@ -206,6 +409,7 @@ export default function KoinApp() {
         <nav aria-label="主导航">
           <NavItem active={view === "overview"} icon="home" label="本月" onClick={() => setView("overview")} />
           <NavItem active={view === "records"} icon="list" label="明细" onClick={() => setView("records")} />
+          <NavItem active={view === "reconcile"} icon="link" label="对账" onClick={() => setView("reconcile")} />
           <NavItem active={view === "insights"} icon="chart" label="分析" onClick={() => setView("insights")} />
           <NavItem active={view === "settings"} icon="settings" label="数据" onClick={() => setView("settings")} />
         </nav>
@@ -242,6 +446,7 @@ export default function KoinApp() {
           </>}
 
           {view === "records" && <RecordsPanel items={visible} onOpen={openEditor} />}
+          {view === "reconcile" && <ReconciliationView transactions={transactions} onConfirm={confirmMatch} onSeparate={keepSeparate} />}
           {view === "insights" && <Insights total={total} items={categoryTotals} expenses={expenses} rangeStart={rangeStart} rangeEnd={rangeEnd} />}
           {view === "settings" && <DataSettings transactions={transactions} onImport={() => setImportOpen(true)} onExport={() => setExportOpen(true)} onClear={() => { setTransactions([]); setToast("本机账本已清空"); }} />}
         </section>
@@ -255,6 +460,7 @@ export default function KoinApp() {
       <nav className="mobile-nav" aria-label="移动端导航">
         <NavItem active={view === "overview"} icon="home" label="本月" onClick={() => setView("overview")} />
         <NavItem active={view === "records"} icon="list" label="明细" onClick={() => setView("records")} />
+        <NavItem active={view === "reconcile"} icon="link" label="对账" onClick={() => setView("reconcile")} />
         <button className="mobile-add" onClick={() => openEditor()} aria-label="记一笔"><Icon name="plus" /></button>
         <NavItem active={view === "insights"} icon="chart" label="分析" onClick={() => setView("insights")} />
         <NavItem active={view === "settings"} icon="settings" label="数据" onClick={() => setView("settings")} />
@@ -362,7 +568,9 @@ function CategoryOrganizer({ items, onMove, onOpen }: { items: Transaction[]; on
             <i aria-hidden="true">{open ? "⌃" : "⌄"}</i>
           </button>
           {open && <div className="bucket-records">
-            {records.length ? records.map((item) => <article
+            {records.length ? records.map((item) => {
+              const display = transactionDisplay(item);
+              return <article
               className={`bucket-record${draggingId === item.id ? " dragging" : ""}`}
               draggable
               key={item.id}
@@ -370,10 +578,11 @@ function CategoryOrganizer({ items, onMove, onOpen }: { items: Transaction[]; on
               onDragEnd={() => { setDraggingId(null); setDropTarget(null); }}
             >
               <span className="drag-handle" title="拖动到其他分区" aria-hidden="true">⠿</span>
-              <button className="bucket-record-main" onClick={() => onOpen(item)}><strong>{item.merchant}</strong><small>{Number(item.date.slice(5, 7))} 月 {Number(item.date.slice(8, 10))} 日 · {item.source}</small></button>
+              <button className="bucket-record-main" onClick={() => onOpen(item)}><strong>{display.primary}</strong><small>{display.merchant ? `商家：${display.merchant} · ` : ""}{Number(item.date.slice(5, 7))} 月 {Number(item.date.slice(8, 10))} 日 · {item.source}</small></button>
               <b className="bucket-amount">¥{money(item.amount)}</b>
-              <label><span className="sr-only">将 {item.merchant} 移动到分类</span><select aria-label={`将 ${item.merchant} 移动到分类`} value={item.category} onChange={(event) => onMove(item.id, event.target.value)}>{CATEGORIES.map((option) => <option key={option}>{option}</option>)}</select></label>
-            </article>) : <div className="bucket-empty">拖到这里即可归类</div>}
+              <label><span className="sr-only">将 {display.primary} 移动到分类</span><select aria-label={`将 ${display.primary} 移动到分类`} value={item.category} onChange={(event) => onMove(item.id, event.target.value)}>{CATEGORIES.map((option) => <option key={option}>{option}</option>)}</select></label>
+            </article>;
+            }) : <div className="bucket-empty">拖到这里即可归类</div>}
           </div>}
         </section>;
       })}
@@ -391,7 +600,7 @@ function RecordsPanel({ items, onOpen, limit }: { items: Transaction[]; onOpen: 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLowerCase();
     return items.filter((item) => {
-      const searchable = [item.merchant, item.note, item.payment, item.source, item.orderId].filter(Boolean).join(" ").toLowerCase();
+      const searchable = [item.merchant, item.note, item.payment, item.source, item.fundingAccount, item.orderId].filter(Boolean).join(" ").toLowerCase();
       return (!keyword || searchable.includes(keyword))
         && (kind === "all" || item.kind === kind)
         && (category === "all" || item.category === category)
@@ -399,8 +608,8 @@ function RecordsPanel({ items, onOpen, limit }: { items: Transaction[]; onOpen: 
     });
   }, [items, query, kind, category, source]);
   const sorted = [...filtered].sort((a, b) => b.date.localeCompare(a.date)).slice(0, limit);
-  const totalExpense = filtered.filter((item) => item.kind === "expense").reduce((sum, item) => sum + item.amount, 0);
-  const totalIncome = filtered.filter((item) => item.kind === "income" || item.kind === "refund").reduce((sum, item) => sum + item.amount, 0);
+  const totalExpense = filtered.filter((item) => item.kind === "expense" && item.counted !== false).reduce((sum, item) => sum + item.amount, 0);
+  const totalIncome = filtered.filter((item) => (item.kind === "income" || item.kind === "refund") && item.counted !== false).reduce((sum, item) => sum + item.amount, 0);
   const filtering = Boolean(query || kind !== "all" || category !== "all" || source !== "all");
   const resetFilters = () => { setQuery(""); setKind("all"); setCategory("all"); setSource("all"); };
 
@@ -411,16 +620,17 @@ function RecordsPanel({ items, onOpen, limit }: { items: Transaction[]; onOpen: 
       <div><span>总收入 <small>含退款</small></span><strong className="summary-income">+ ¥{money(totalIncome)}</strong></div>
     </div>
     {items.length > 0 && <div className="record-filters">
-      <label className="record-search"><span className="sr-only">搜索明细</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索商家、备注或订单号" /></label>
-      <label><span className="sr-only">收支类型</span><select value={kind} onChange={(event) => setKind(event.target.value as Kind | "all")}><option value="all">全部收支</option><option value="expense">支出</option><option value="income">收入</option><option value="refund">退款</option><option value="transfer">不计消费</option></select></label>
+      <label className="record-search"><span className="sr-only">搜索明细</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索商品、商家或订单号" /></label>
+      <label><span className="sr-only">收支类型</span><select value={kind} onChange={(event) => setKind(event.target.value as Kind | "all")}><option value="all">全部收支</option><option value="expense">支出</option><option value="income">收入</option><option value="refund">退款</option><option value="repayment">还款</option><option value="transfer">转账/不计</option></select></label>
       <label><span className="sr-only">消费分类</span><select value={category} onChange={(event) => setCategory(event.target.value)}><option value="all">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select></label>
       <label><span className="sr-only">账目来源</span><select value={source} onChange={(event) => setSource(event.target.value)}><option value="all">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select></label>
       {filtering && <button className="clear-filters" onClick={resetFilters}>清除筛选</button>}
     </div>}
     {filtering && <div className="filter-result">筛选到 {filtered.length} 条记录</div>}
     {sorted.length ? <div className="records">{sorted.map((item) => {
-      const note = cleanImportedNote(item.note);
-      return <button className="record" key={item.id} onClick={() => onOpen(item)}><span className="category-icon" style={{ background: `${CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他}22`, color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{item.category.slice(0, 1)}</span><span className="record-main"><strong>{item.merchant}</strong><small>{Number(item.date.slice(5, 7))} 月 {Number(item.date.slice(8, 10))} 日 · {item.payment} · {item.source}{note ? ` · ${note}` : ""}</small></span><span className={item.kind === "refund" || item.kind === "income" ? "amount positive" : "amount"}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{money(item.amount)}</span></button>;
+      const display = transactionDisplay(item);
+      const amountClass = item.counted === false ? "amount not-counted" : item.kind === "refund" || item.kind === "income" ? "amount positive" : "amount";
+      return <button className="record" key={item.id} onClick={() => onOpen(item)}><span className="category-icon" style={{ background: `${CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他}22`, color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{item.category.slice(0, 1)}</span><span className="record-main"><strong>{display.primary}{item.matchStatus === "review" ? <em className="review-tag">待确认</em> : null}</strong><small>{display.merchant ? `商家：${display.merchant} · ` : ""}{Number(item.date.slice(5, 7))} 月 {Number(item.date.slice(8, 10))} 日 · {item.payment} · {item.source} · {item.fundingAccount ?? "未识别"}{display.note ? ` · ${display.note}` : ""}</small></span><span className={amountClass}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{money(item.amount)}</span></button>;
     })}</div> : <div className="small-empty">{filtering ? "没有符合筛选条件的记录" : "所选账期还没有记录"}</div>}
   </section>;
 }
@@ -430,20 +640,62 @@ function Insights({ total, items, expenses, rangeStart, rangeEnd }: { total: num
   return <section className="insights-view"><div className="view-heading"><span className="eyebrow">消费分析</span><h1>{rangeLabel(rangeStart, rangeEnd)}</h1><p>只统计真实消费，不包含花呗还款与账户互转。</p></div><div className="stat-row"><div><span>日均消费</span><strong>¥{money(total / Math.max(days, 1))}</strong></div><div><span>单笔平均</span><strong>¥{money(total / Math.max(expenses.length, 1))}</strong></div><div><span>消费笔数</span><strong>{expenses.length} 笔</strong></div></div><section className="panel insight-list"><PanelTitle title="分类排行" subtitle="金额由高到低" />{items.length ? items.map((item) => <div className="rank" key={item.category}><span className="dot" style={{ background: CATEGORY_COLORS[item.category] }} /><strong>{item.category}</strong><div><span style={{ width: `${item.amount / Math.max(items[0].amount, 1) * 100}%`, background: CATEGORY_COLORS[item.category] }} /></div><b>¥{money(item.amount)}</b></div>) : <div className="small-empty">导入账单后，这里会生成消费分析</div>}</section></section>;
 }
 
+function ReconciliationView({ transactions, onConfirm, onSeparate }: { transactions: Transaction[]; onConfirm: (id: string) => void; onSeparate: (id: string) => void }) {
+  const pending = transactions.filter((item) => item.matchStatus === "review" && item.possibleMatchId);
+  const linked = transactions.filter((item) => (item.evidence?.length ?? 0) > 1);
+  const excluded = transactions.filter((item) => item.kind === "repayment" || item.kind === "transfer");
+  const byId = new Map(transactions.map((item) => [item.id, item]));
+  return <section className="reconcile-view">
+    <div className="view-heading"><span className="eyebrow">统一对账</span><h1>一笔消费，只统计一次</h1><p>订单、支付和银行卡流水都会保留；能够确认的记录会归入同一消费组。</p></div>
+    <div className="reconcile-stats">
+      <div><span>已关联消费</span><strong>{linked.length} 组</strong></div>
+      <div><span>排除还款/转账</span><strong>{excluded.length} 条</strong></div>
+      <div className={pending.length ? "needs-review" : ""}><span>等待确认</span><strong>{pending.length} 组</strong></div>
+    </div>
+
+    <section className="panel review-panel">
+      <PanelTitle title="等待确认" subtitle="金额和时间相近，但缺少足够的共同编号" />
+      {pending.length ? <div className="review-list">{pending.map((candidate) => {
+        const target = byId.get(candidate.possibleMatchId!);
+        if (!target) return null;
+        return <article className="review-card" key={candidate.id}>
+          <div className="review-pair"><EvidenceSummary item={target} label="已存在" /><span className="review-link">可能是同一笔</span><EvidenceSummary item={candidate} label="新流水" /></div>
+          <div className="review-actions"><button className="secondary" onClick={() => onSeparate(candidate.id)}>保留为两笔</button><button className="primary" onClick={() => onConfirm(candidate.id)}>合并，只统计一次</button></div>
+        </article>;
+      })}</div> : <div className="reconcile-empty">✓ 暂无需要确认的疑似重复流水</div>}
+    </section>
+
+    <section className="panel linked-panel">
+      <PanelTitle title="已关联的消费" subtitle="展开后可以查看订单、支付渠道与资金账户凭证" />
+      {linked.length ? <div className="linked-groups">{linked.slice(0, 30).map((item) => { const display = transactionDisplay(item); return <details key={item.id}><summary><span><strong>{display.primary}</strong><small>{display.merchant ? `商家：${display.merchant} · ` : ""}{item.date} · {item.source} · {item.payment}</small></span><b>¥{money(item.amount)}</b><em>{item.evidence?.length} 条凭证</em></summary><div className="evidence-list">{item.evidence?.map((evidence) => <div key={evidence.id}><span>{evidence.source}</span><p><strong>{evidence.merchant}</strong><small>{evidence.date} · {evidence.payment} · {evidence.fundingAccount}</small></p><b>¥{money(evidence.amount)}</b></div>)}</div></details>; })}</div> : <div className="small-empty">继续导入不同平台账单后，这里会显示自动关联结果</div>}
+    </section>
+
+    <section className="panel excluded-panel">
+      <PanelTitle title="不计入消费" subtitle="还款、转账、提现和账户互转会保留，但不会重复计算" />
+      {excluded.length ? <div className="excluded-list">{excluded.slice(0, 30).map((item) => <div key={item.id}><span>{kindLabel(item.kind)}</span><p><strong>{item.merchant}</strong><small>{item.date} · {item.source} · {item.fundingAccount}</small></p><b>¥{money(item.amount)}</b></div>)}</div> : <div className="small-empty">目前没有被排除的还款或转账记录</div>}
+    </section>
+  </section>;
+}
+
+function EvidenceSummary({ item, label }: { item: Transaction; label: string }) {
+  const display = transactionDisplay(item);
+  return <div className="evidence-summary"><span>{label} · {item.source}</span><strong>{display.primary}</strong><small>{display.merchant ? `商家：${display.merchant} · ` : ""}{item.date} · {item.payment} · {item.fundingAccount}{display.note ? ` · ${display.note}` : ""}</small><b>¥{money(item.amount)}</b></div>;
+}
+
 function DataSettings({ transactions, onImport, onExport, onClear }: { transactions: Transaction[]; onImport: () => void; onExport: () => void; onClear: () => void }) {
   function backup() {
-    const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), transactions }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ version: 2, exportedAt: new Date().toISOString(), transactions }, null, 2)], { type: "application/json" });
     const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `Koin-backup-${localDate(1).slice(0, 7)}.json`; link.click(); URL.revokeObjectURL(link.href);
   }
-  return <section className="settings-view"><div className="view-heading"><span className="eyebrow">本机数据</span><h1>你的账本，只属于你</h1><p>Koin 不需要账号，账单解析和保存都在当前浏览器完成。</p></div><div className="settings-grid"><button className="setting-card" onClick={onImport}><span className="setting-icon"><Icon name="upload" /></span><div><strong>导入账单</strong><small>微信、支付宝及通用 CSV / TXT</small></div><Icon name="next" /></button><button className="setting-card" onClick={onExport}><span className="setting-icon"><Icon name="download" /></span><div><strong>导出期间账单</strong><small>按本周、本月或自定义日期导出 CSV</small></div><Icon name="next" /></button><button className="setting-card" onClick={backup}><span className="setting-icon"><Icon name="download" /></span><div><strong>导出完整备份</strong><small>保存 {transactions.length} 条记录为可恢复的 JSON</small></div><Icon name="next" /></button><button className="setting-card danger" onClick={() => { if (confirm("确定清空当前浏览器中的所有 Koin 记录吗？此操作无法撤销。")) onClear(); }}><span className="setting-icon"><Icon name="close" /></span><div><strong>清空本机账本</strong><small>删除当前浏览器中的全部记录</small></div><Icon name="next" /></button></div><div className="privacy-card"><span><Icon name="lock" /></span><div><strong>本地优先</strong><p>关闭页面后数据仍会保留，但清理浏览器数据可能导致丢失。建议定期导出备份。</p></div></div></section>;
+  return <section className="settings-view"><div className="view-heading"><span className="eyebrow">本机数据</span><h1>你的账本，只属于你</h1><p>Koin 不需要账号，账单解析和保存都在当前浏览器完成。</p></div><div className="settings-grid"><button className="setting-card" onClick={onImport}><span className="setting-icon"><Icon name="upload" /></span><div><strong>导入账单</strong><small>微信、支付宝、月付和银行卡账单</small></div><Icon name="next" /></button><button className="setting-card" onClick={onExport}><span className="setting-icon"><Icon name="download" /></span><div><strong>导出期间账单</strong><small>按本周、本月或自定义日期导出 CSV</small></div><Icon name="next" /></button><button className="setting-card" onClick={backup}><span className="setting-icon"><Icon name="download" /></span><div><strong>导出完整备份</strong><small>保存 {transactions.length} 条记录为可恢复的 JSON</small></div><Icon name="next" /></button><button className="setting-card danger" onClick={() => { if (confirm("确定清空当前浏览器中的所有 Koin 记录吗？此操作无法撤销。")) onClear(); }}><span className="setting-icon"><Icon name="close" /></span><div><strong>清空本机账本</strong><small>删除当前浏览器中的全部记录</small></div><Icon name="next" /></button></div><div className="privacy-card"><span><Icon name="lock" /></span><div><strong>本地优先</strong><p>关闭页面后数据仍会保留，但清理浏览器数据可能导致丢失。建议定期导出备份。</p></div></div></section>;
 }
 
 function TransactionEditor({ initial, initialAmount, onClose, onSave, onDelete }: { initial: Transaction | null; initialAmount?: number; onClose: () => void; onSave: (item: Transaction) => void; onDelete?: () => void }) {
-  const [form, setForm] = useState<Transaction>(initial ?? { id: crypto.randomUUID(), date: localDate(new Date().getDate()), merchant: "", amount: initialAmount ?? 0, category: "餐饮", payment: "支付宝", source: "手动", kind: "expense", note: "" });
+  const [form, setForm] = useState<Transaction>(initial ?? { id: crypto.randomUUID(), date: localDate(new Date().getDate()), merchant: "", amount: initialAmount ?? 0, category: "餐饮", payment: "支付宝", fundingAccount: "未识别", source: "手动", kind: "expense", counted: true, matchStatus: "single", note: "" });
   const [mobileCalculator, setMobileCalculator] = useState(false);
   function change(field: keyof Transaction, value: string | number) { setForm((current) => ({ ...current, [field]: value })); }
-  function submit(event: FormEvent) { event.preventDefault(); if (!form.merchant.trim() || form.amount <= 0) return; onSave({ ...form, merchant: form.merchant.trim(), amount: Number(form.amount) }); }
-  return <Modal title={initial ? "编辑记录" : "记一笔"} onClose={onClose}><form className="transaction-form" onSubmit={submit}><label className="amount-field"><span>金额</span><div><b>¥</b><input autoFocus type="number" min="0.01" step="0.01" value={form.amount || ""} onChange={(event) => change("amount", Number(event.target.value))} placeholder="0.00" required /></div></label><button type="button" className="inline-calculator-toggle" onClick={() => setMobileCalculator((open) => !open)}>⌗ {mobileCalculator ? "收起计算器" : "计算金额"}</button>{mobileCalculator && <div className="inline-calculator"><Calculator onUse={(amount) => { change("amount", amount); setMobileCalculator(false); }} /></div>}<div className="kind-tabs">{([ ["expense", "支出"], ["refund", "退款"], ["income", "收入"], ["transfer", "不计消费"] ] as [Kind, string][]).map(([value, label]) => <button type="button" className={form.kind === value ? "active" : ""} key={value} onClick={() => change("kind", value)}>{label}</button>)}</div><label><span>商家 / 用途</span><input value={form.merchant} onChange={(event) => change("merchant", event.target.value)} placeholder="例如：午间食堂" required /></label><div className="field-row"><label><span>日期</span><input type="date" value={form.date} onChange={(event) => change("date", event.target.value)} required /></label><label><span>分类</span><select value={form.category} onChange={(event) => change("category", event.target.value)}>{CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label></div><div className="field-row"><label><span>账目来源</span><select value={form.source} onChange={(event) => change("source", event.target.value)}>{["手动", "微信", "支付宝", "抖音", "美团", "京东", "淘宝", "其他"].map((item) => <option key={item}>{item}</option>)}</select></label><label><span>支付方式</span><select value={form.payment} onChange={(event) => change("payment", event.target.value)}>{["支付宝", "花呗", "微信支付", "银行卡", "现金", "其他"].map((item) => <option key={item}>{item}</option>)}</select></label></div><label><span>备注</span><input value={form.note ?? ""} onChange={(event) => change("note", event.target.value)} placeholder="选填" /></label><div className="source-help">账目来源表示订单来自哪里，支付方式表示钱通过哪里付出。例如：来源“美团”，支付方式“花呗”。</div><div className="form-actions">{onDelete && <button type="button" className="delete-button" onClick={onDelete}>删除</button>}<button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存记录</button></div></form></Modal>;
+  function submit(event: FormEvent) { event.preventDefault(); if (!form.merchant.trim() || form.amount <= 0) return; const excluded = form.kind === "repayment" || form.kind === "transfer"; onSave({ ...form, merchant: form.merchant.trim(), amount: Number(form.amount), counted: !excluded, matchStatus: excluded ? "excluded" : form.matchStatus === "review" ? "single" : form.matchStatus }); }
+  return <Modal title={initial ? "编辑记录" : "记一笔"} onClose={onClose}><form className="transaction-form" onSubmit={submit}><label className="amount-field"><span>金额</span><div><b>¥</b><input autoFocus type="number" min="0.01" step="0.01" value={form.amount || ""} onChange={(event) => change("amount", Number(event.target.value))} placeholder="0.00" required /></div></label><button type="button" className="inline-calculator-toggle" onClick={() => setMobileCalculator((open) => !open)}>⌗ {mobileCalculator ? "收起计算器" : "计算金额"}</button>{mobileCalculator && <div className="inline-calculator"><Calculator onUse={(amount) => { change("amount", amount); setMobileCalculator(false); }} /></div>}<div className="kind-tabs">{([ ["expense", "支出"], ["refund", "退款"], ["income", "收入"], ["repayment", "还款"], ["transfer", "转账/不计"] ] as [Kind, string][]).map(([value, label]) => <button type="button" className={form.kind === value ? "active" : ""} key={value} onClick={() => change("kind", value)}>{label}</button>)}</div><label><span>商家</span><input value={form.merchant} onChange={(event) => change("merchant", event.target.value)} placeholder="例如：午间食堂" required /></label><div className="field-row"><label><span>日期</span><input type="date" value={form.date} onChange={(event) => change("date", event.target.value)} required /></label><label><span>分类</span><select value={form.category} onChange={(event) => change("category", event.target.value)}>{CATEGORIES.map((item) => <option key={item}>{item}</option>)}</select></label></div><div className="field-row"><label><span>账目来源</span><select value={form.source} onChange={(event) => change("source", event.target.value)}>{["手动", "微信", "支付宝", "抖音", "抖音月付", "美团", "美团月付", "京东", "淘宝", "银行卡", "其他"].map((item) => <option key={item}>{item}</option>)}</select></label><label><span>支付渠道</span><select value={form.payment} onChange={(event) => change("payment", event.target.value)}>{["支付宝", "微信支付", "银行卡", "美团月付", "抖音月付", "京东白条", "现金", "其他"].map((item) => <option key={item}>{item}</option>)}</select></label></div><label><span>资金账户</span><select value={form.fundingAccount ?? "未识别"} onChange={(event) => change("fundingAccount", event.target.value)}>{["未识别", "微信零钱", "支付宝余额", "银行卡", "花呗", "京东白条", "美团月付", "抖音月付", "现金", "其他"].map((item) => <option key={item}>{item}</option>)}</select></label><label><span>商品 / 用途</span><input value={form.note ?? ""} onChange={(event) => change("note", event.target.value)} placeholder="有内容时优先显示" /></label><div className="source-help">账目来源是订单在哪里产生，支付渠道是通过哪里付款，资金账户是最终从哪里出钱。月付、花呗、白条消费发生时计入，之后还款不重复计算。</div><div className="form-actions">{onDelete && <button type="button" className="delete-button" onClick={onDelete}>删除</button>}<button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存记录</button></div></form></Modal>;
 }
 
 function Calculator({ compact = false, onUse }: { compact?: boolean; onUse: (amount: number) => void }) {
@@ -522,10 +774,10 @@ function ExportDialog({ transactions, selectedStart, selectedEnd, onClose, onExp
   const refund = selected.filter((item) => item.kind === "refund").reduce((sum, item) => sum + item.amount, 0);
 
   function exportCsv() {
-    const kindLabels: Record<Kind, string> = { expense: "支出", refund: "退款", income: "收入", transfer: "不计消费" };
+    const kindLabels: Record<Kind, string> = { expense: "支出", refund: "退款", income: "收入", repayment: "还款", transfer: "转账/不计消费" };
     const escape = (value: string | number | undefined) => `"${String(value ?? "").replace(/"/g, '""')}"`;
-    const headers = ["日期", "类型", "商家/用途", "金额（元）", "分类", "账目来源", "支付方式", "订单号", "备注"];
-    const rows = selected.map((item) => [item.date, kindLabels[item.kind], item.merchant, item.amount.toFixed(2), item.category, item.source, item.payment, item.orderId, item.note].map(escape).join(","));
+    const headers = ["日期", "类型", "商家/用途", "金额（元）", "分类", "账目来源", "支付渠道", "资金账户", "是否计入消费", "关联凭证数", "订单号", "备注"];
+    const rows = selected.map((item) => [item.date, kindLabels[item.kind], item.merchant, item.amount.toFixed(2), item.category, item.source, item.payment, item.fundingAccount, item.counted === false ? "否" : "是", item.evidence?.length ?? 1, item.orderId, item.note].map(escape).join(","));
     const summary = [`导出期间,${escape(`${start} 至 ${end}`)}`, `实际消费合计,${escape((expense - refund).toFixed(2))}`, ""];
     const blob = new Blob(["\uFEFF", [...summary, headers.map(escape).join(","), ...rows].join("\r\n")], { type: "text/csv;charset=utf-8" });
     const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `Koin账单_${start}_${end}.csv`; link.click(); URL.revokeObjectURL(link.href); onExported(selected.length);
@@ -538,13 +790,14 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-label={title}><header><h2>{title}</h2><button onClick={onClose} aria-label="关闭"><Icon name="close" /></button></header>{children}</section></div>;
 }
 
-function ImportDialog({ existing, onClose, onComplete }: { existing: Transaction[]; onClose: () => void; onComplete: (items: Transaction[], skipped: number) => void }) {
+function ImportDialog({ existing, onClose, onComplete }: { existing: Transaction[]; onClose: () => void; onComplete: (plan: ImportPlan) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [platform, setPlatform] = useState("自动识别");
   const [rows, setRows] = useState<Transaction[]>([]);
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [skipped, setSkipped] = useState(0);
+  const [plan, setPlan] = useState<ImportPlan | null>(null);
   const [dragging, setDragging] = useState(false);
 
   useEffect(() => {
@@ -599,12 +852,11 @@ function ImportDialog({ existing, onClose, onComplete }: { existing: Transaction
   }
 
   function prepare(items: Transaction[]) {
-    const keys = new Set(existing.map(dedupeKey)); let duplicateCount = 0;
-    const unique = items.filter((item) => { const key = dedupeKey(item); if (keys.has(key)) { duplicateCount++; return false; } keys.add(key); return true; });
-    setRows(unique); setSkipped(duplicateCount);
+    const next = buildImportPlan(existing, items.map((item) => normalizeTransaction({ ...item, note: cleanImportedNote(item.note) })));
+    setRows(next.preview); setSkipped(next.skipped); setPlan(next);
   }
 
-  return <Modal title="导入账单" onClose={onClose}><div className="import-dialog"><div className="platforms">{["自动识别", "微信", "支付宝", "抖音", "美团"].map((item) => <button key={item} className={platform === item ? "active" : ""} onClick={() => setPlatform(item)}>{item}</button>)}</div><button className={dragging ? "drop-zone dragging" : "drop-zone"} onClick={() => inputRef.current?.click()} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files?.[0]; if (file) processFile(file); }}><span className="upload-mark"><Icon name="upload" /></span><strong>{dragging ? "松开即可读取账单" : fileName || "选择、拖入或粘贴账单"}</strong><small>支持 CSV、TXT、TSV、Koin 备份，或按 Ctrl + V 粘贴表格</small><em>文件仅在本机读取，不会上传</em></button><input ref={inputRef} hidden type="file" accept=".csv,.txt,.tsv,.json" onChange={readFile} />{error && <p className="import-error">{error}</p>}{rows.length > 0 && <div className="import-preview"><div><strong>准备导入 {rows.length} 笔</strong><span>{skipped ? `已识别并跳过 ${skipped} 笔重复记录` : "未发现重复记录"}</span></div>{rows.slice(0, 3).map((item) => <p key={item.id}><span>{item.date} · {item.merchant}</span><b>¥{money(item.amount)}</b></p>)}</div>}<div className="import-rules"><strong>Koin 会这样统计</strong><ul><li>花呗付款计入消费，花呗和信用卡还款不计入</li><li>转账、提现和余额互转不计入消费</li><li>相同订单号或相同时间、商家、金额的记录会去重</li></ul></div><div className="form-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={!rows.length} onClick={() => onComplete(rows, skipped)}>确认导入</button></div></div></Modal>;
+  return <Modal title="导入并统一对账" onClose={onClose}><div className="import-dialog"><div className="platforms">{["自动识别", "微信", "支付宝", "银行卡", "美团", "美团月付", "抖音", "抖音月付"].map((item) => <button key={item} className={platform === item ? "active" : ""} onClick={() => setPlatform(item)}>{item}</button>)}</div><button className={dragging ? "drop-zone dragging" : "drop-zone"} onClick={() => inputRef.current?.click()} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files?.[0]; if (file) processFile(file); }}><span className="upload-mark"><Icon name="upload" /></span><strong>{dragging ? "松开即可读取账单" : fileName || "选择、拖入或粘贴账单"}</strong><small>支持微信 XLSX、平台或银行卡 CSV、TXT、TSV，以及 Koin 备份</small><em>文件只在本机解析，原始流水会作为关联凭证保留</em></button><input ref={inputRef} hidden type="file" accept=".xlsx,.csv,.txt,.tsv,.json" onChange={readFile} />{error && <p className="import-error">{error}</p>}{plan && <div className="import-outcomes"><div><span>新增消费</span><strong>{plan.added}</strong></div><div><span>自动关联</span><strong>{plan.linked}</strong></div><div><span>排除还款/转账</span><strong>{plan.excluded}</strong></div><div className={plan.review ? "attention" : ""}><span>待确认</span><strong>{plan.review}</strong></div></div>}{rows.length > 0 && <div className="import-preview"><div><strong>读取 {rows.length} 条有效流水</strong><span>{skipped ? `另跳过 ${skipped} 条已导入记录` : "未发现已导入记录"}</span></div>{rows.slice(0, 3).map((item) => <p key={item.id}><span>{item.date} · {item.merchant} · {kindLabel(item.kind)}</span><b>¥{money(item.amount)}</b></p>)}</div>}<div className="import-rules"><strong>Koin 会这样统计</strong><ul><li>消费发生时计入；花呗、白条和月付还款不再计算</li><li>订单、微信/支付宝支付与银行卡扣款会尝试关联为同一消费组</li><li>证据不足的相似流水暂不计入，进入“对账”栏目等待确认</li></ul></div><div className="form-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={!plan?.imported} onClick={() => plan && onComplete(plan)}>确认导入</button></div></div></Modal>;
 }
 
 function parseDelimited(raw: string, sourceHint: string): Transaction[] {
@@ -620,25 +872,25 @@ function parseDelimited(raw: string, sourceHint: string): Transaction[] {
   const productIndex = find(/商品说明|商品名称|商品$|用途/);
   const amountIndex = find(/金额.*元|实付金额|订单金额|交易金额|金额/);
   const paymentIndex = find(/支付方式|付款方式|资金状态/);
+  const accountIndex = find(/资金账户|扣款账户|付款账户|账户名称|卡号|银行卡/);
   const statusIndex = find(/交易状态|订单状态|状态/);
   const typeIndex = find(/收\s*\/?\s*支|交易类型|业务类型/);
   const categoryIndex = find(/交易分类|订单分类/);
   const orderIndex = find(/交易单号|订单号|商户单号/);
-  const source = /微信/.test(sourceHint) ? "微信" : /支付宝/.test(sourceHint) ? "支付宝" : /抖音/.test(sourceHint) ? "抖音" : /美团/.test(sourceHint) ? "美团" : "账单导入";
+  const source = detectSource(sourceHint);
   if (dateIndex < 0 || amountIndex < 0) return [];
   return lines.slice(headerIndex + 1).map((line, index) => {
-    const cells = splitRow(line, delimiter); const status = cells[statusIndex] ?? ""; const type = cells[typeIndex] ?? ""; const product = (cells[productIndex] ?? "").trim(); const merchant = (cells[merchantIndex] || product || "未命名消费").trim(); const payment = (cells[paymentIndex] || source).trim();
+    const cells = splitRow(line, delimiter); const status = cells[statusIndex] ?? ""; const type = cells[typeIndex] ?? ""; const product = (cells[productIndex] ?? "").trim(); const merchant = (cells[merchantIndex] || product || "未命名消费").trim(); const rawPayment = (cells[paymentIndex] || source).trim();
     if (/关闭|取消|失败|未支付/.test(status)) return null;
-    let kind: Kind = "expense";
-    const combined = `${type} ${merchant} ${status}`;
-    if (/退款|退回/.test(`${type} ${cells[categoryIndex] ?? ""} ${merchant}`)) kind = "refund";
-    else if (/收入|收款/.test(type)) kind = "income";
-    else if (/不计收支|中性/.test(type) || /还款|转账|提现|充值|余额宝|账户互转/.test(combined)) kind = "transfer";
+    const combined = `${type} ${merchant} ${product} ${status} ${cells[categoryIndex] ?? ""}`;
+    const kind = inferKind(combined, type);
     const number = Number((cells[amountIndex] ?? "").replace(/[¥￥,\s]/g, "").replace(/^[-+]/, ""));
     const dateMatch = (cells[dateIndex] ?? "").match(/(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
     if (!dateMatch || !Number.isFinite(number) || number <= 0) return null;
     const date = `${dateMatch[1]}-${dateMatch[2].padStart(2, "0")}-${dateMatch[3].padStart(2, "0")}`;
-    return { id: crypto.randomUUID(), date, merchant, amount: number, category: normalizeCategory(cells[categoryIndex] ?? "", `${merchant} ${product}`), payment: /花呗/.test(payment) ? "花呗" : payment, source, kind, orderId: cells[orderIndex]?.replace(/\t/g, "").trim() || undefined, note: product && product !== merchant ? product : undefined } satisfies Transaction;
+    const payment = normalizePaymentChannel(rawPayment, source, combined);
+    const fundingAccount = inferFundingAccount(`${rawPayment} ${cells[accountIndex] ?? ""}`, source, combined);
+    return { id: crypto.randomUUID(), date, merchant, amount: number, category: normalizeCategory(cells[categoryIndex] ?? "", `${merchant} ${product}`), payment, fundingAccount, source, kind, counted: kind !== "repayment" && kind !== "transfer", matchStatus: kind === "repayment" || kind === "transfer" ? "excluded" : "single", orderId: cells[orderIndex]?.replace(/\t/g, "").trim() || undefined, note: product && product !== merchant ? product : undefined } satisfies Transaction;
   }).filter((item): item is Transaction => Boolean(item));
 }
 
@@ -655,9 +907,10 @@ function parseMatrix(matrix: (string | number | Date | null)[][], sourceHint: st
   const flowIndex = find(/收\/支|收支/);
   const amountIndex = find(/金额/);
   const paymentIndex = find(/支付方式|付款方式/);
+  const accountIndex = find(/资金账户|扣款账户|付款账户|账户名称|卡号|银行卡/);
   const statusIndex = find(/当前状态|交易状态|状态/);
   const orderIndex = find(/交易单号|交易订单号|订单号/);
-  const source = /微信/.test(sourceHint) ? "微信" : /支付宝/.test(sourceHint) ? "支付宝" : "账单导入";
+  const source = detectSource(sourceHint);
   return rows.slice(headerIndex + 1).map((cells, index) => {
     const dateMatch = (cells[dateIndex] ?? "").match(/(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
     const amount = Number((cells[amountIndex] ?? "").replace(/[¥￥,\s]/g, "").replace(/^[-+]/, ""));
@@ -665,21 +918,22 @@ function parseMatrix(matrix: (string | number | Date | null)[][], sourceHint: st
     const type = cells[typeIndex] ?? ""; const merchant = cells[merchantIndex] || cells[productIndex] || "未命名消费"; const product = cells[productIndex] ?? ""; const flow = cells[flowIndex] ?? ""; const status = cells[statusIndex] ?? "";
     if (/关闭|取消|失败|未支付/.test(status)) return null;
     const combined = `${type} ${merchant} ${product}`;
-    let kind: Kind = "expense";
-    if (/退款|退回/.test(`${type} ${merchant}`)) kind = "refund";
-    else if (/收入/.test(flow)) kind = "income";
-    else if (/还款|转账|提现|充值|理财|零钱通存取|信用卡/.test(combined) || /中性|不计收支|\/$/.test(flow)) kind = "transfer";
+    const kind = inferKind(`${combined} ${status}`, flow);
     const date = `${dateMatch[1]}-${dateMatch[2].padStart(2, "0")}-${dateMatch[3].padStart(2, "0")}`;
-    const payment = cells[paymentIndex] || source;
-    return { id: crypto.randomUUID(), date, merchant, amount, category: normalizeCategory("", `${merchant} ${product}`), payment: /花呗/.test(payment) ? "花呗" : payment, source, kind, orderId: cells[orderIndex]?.replace(/\t/g, "").trim() || undefined, note: product && product !== merchant ? product : undefined } satisfies Transaction;
+    const rawPayment = cells[paymentIndex] || source;
+    const payment = normalizePaymentChannel(rawPayment, source, combined);
+    const fundingAccount = inferFundingAccount(`${rawPayment} ${cells[accountIndex] ?? ""}`, source, combined);
+    return { id: crypto.randomUUID(), date, merchant, amount, category: normalizeCategory("", `${merchant} ${product}`), payment, fundingAccount, source, kind, counted: kind !== "repayment" && kind !== "transfer", matchStatus: kind === "repayment" || kind === "transfer" ? "excluded" : "single", orderId: cells[orderIndex]?.replace(/\t/g, "").trim() || undefined, note: product && product !== merchant ? product : undefined } satisfies Transaction;
   }).filter((item): item is Transaction => Boolean(item));
 }
 
 function normalizeCategory(platformCategory: string, merchant: string) {
   if (/餐饮|美食/.test(platformCategory)) return "餐饮";
-  if (/日用|百货|服饰|购物|数码|电器/.test(platformCategory)) return "购物";
+  if (/生活|日用/.test(platformCategory)) return "生活";
+  if (/百货|服饰|购物|数码|电器/.test(platformCategory)) return "购物";
   if (/交通|出行/.test(platformCategory)) return "交通";
-  if (/娱乐|休闲|游戏/.test(platformCategory)) return "娱乐";
+  if (/游戏/.test(platformCategory)) return "游戏";
+  if (/娱乐|休闲/.test(platformCategory)) return "娱乐";
   if (/住房|居住|物业/.test(platformCategory)) return "居住";
   if (/医疗|健康/.test(platformCategory)) return "医疗";
   if (/教育|学习/.test(platformCategory)) return "学习";

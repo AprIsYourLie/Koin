@@ -1,54 +1,15 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-/node_modules
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
-
-# testing
-/coverage
-
-# next.js
-/.next/
-/.vinext/
-/out/
-
-# misc
-.DS_Store
-*.pem
-
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
-# env files (can opt-in for committing if needed)
-.env*
-
-# vercel
-.vercel
-
+# Installed dependencies and generated output
+/node_modules/
 /dist/
-/.wrangler/
-/outputs/
-/work/
+/release/
+/coverage/
 /.npm-cache/
 
-# local development logs
-/.dev-server.*.log
+# Local logs and environment values
+*.log
+.env*
 
-# unused starter/template files (not part of Koin)
-/examples/
-/db/
-/drizzle/
-/drizzle.config.ts
-/app/chatgpt-auth.ts
-/public/file.svg
-/public/globe.svg
-/public/window.svg
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+*.pem
