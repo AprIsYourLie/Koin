@@ -10,8 +10,7 @@ const eslintConfig = defineConfig([
   globalIgnores([
     "dist/**",
     "release/**",
-    "out/**",
-    "build/**",
+    "src-tauri/target/**",
   ]),
   eslint.configs.recommended,
   ...tseslint.configs.recommended,

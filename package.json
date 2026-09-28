@@ -15,7 +15,7 @@
     "desktop:portable": "tauri build --no-bundle && node scripts/copy-portable.mjs",
     "desktop:installer": "tauri build --bundles nsis",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern release --ignore-pattern src-tauri/target"
+    "lint": "eslint ."
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.0",
