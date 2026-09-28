@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("builds the Koin desktop renderer", async () => {
+test("builds a self-contained desktop renderer", async () => {
   const html = await readFile(new URL("../dist/index.html", import.meta.url), "utf8");
   assert.match(html, /<title>Koin · 看清每个月的钱花在哪里<\/title>/i);
   assert.match(html, /<div id="root"><\/div>/i);
@@ -10,51 +10,15 @@ test("builds the Koin desktop renderer", async () => {
   assert.doesNotMatch(html, /localhost|codex-preview/i);
 });
 
-test("includes source tracking, reconciliation, and period CSV export", async () => {
+test("shows the three-page JSON workflow", async () => {
   const app = await readFile(new URL("../app/KoinApp.tsx", import.meta.url), "utf8");
-  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
-  assert.match(app, /账目来源/);
-  assert.match(app, /导出期间账单/);
-  assert.match(app, /本周/);
-  assert.match(app, /自定义/);
-  assert.match(app, /Koin账单_/);
-  assert.match(app, /用 ¥/);
-  assert.match(app, /记账计算器/);
-  assert.match(app, /近 7 天/);
-  assert.match(app, /选择账期/);
-  assert.match(app, /PeriodPicker/);
-  assert.match(app, /拖入或粘贴账单/);
-  assert.match(app, /addEventListener\("paste"/);
-  assert.match(app, /XLSX\.read/);
-  assert.match(app, /parseMatrix/);
-  assert.match(app, /总收入/);
-  assert.match(app, /总支出/);
-  assert.match(app, /全部来源/);
-  assert.match(app, /搜索商品、商家或订单号/);
-  assert.match(app, /cleanImportedNote/);
-  assert.match(app, /transactionDisplay/);
-  assert.match(app, /GENERIC_PRODUCT_NOTES/);
-  assert.match(app, /商家：\$\{display\.merchant\}/);
-  assert.doesNotMatch(app, /note: `导入行/);
-  assert.match(app, /dailySpendLevel/);
-  assert.match(app, /¥500\+/);
-  assert.match(app, /消费分区/);
-  assert.match(app, /CategoryOrganizer/);
-  assert.match(app, /draggable/);
-  assert.match(app, /拖动账目到其他分区/);
-  assert.match(app, /游戏/);
-  assert.match(app, /生活/);
-  assert.match(app, /统一对账/);
-  assert.match(app, /资金账户/);
-  assert.match(app, /美团月付/);
-  assert.match(app, /抖音月付/);
-  assert.match(app, /buildImportPlan/);
-  assert.match(app, /item\.matchStatus === "review" && item\.counted === false/);
-  assert.match(app, /possibleMatchId/);
-  assert.match(app, /排除还款\/转账/);
-  assert.match(app, /合并，只统计一次/);
-  assert.match(app, /是否计入消费/);
-  assert.match(css, /\.view-heading h1[^}]*Microsoft YaHei UI/);
-  assert.match(css, /\.stat-row strong[^}]*font-variant-numeric:tabular-nums/);
-  assert.match(css, /\.rank b[^}]*Microsoft YaHei UI/);
+  assert.match(app, /label="概览"/);
+  assert.match(app, /label="明细"/);
+  assert.match(app, /label="数据"/);
+  assert.match(app, /导入 Koin JSON/);
+  assert.match(app, /导出整理后的 JSON/);
+  assert.match(app, /勾选当前结果/);
+  assert.match(app, /商家累计/);
+  assert.match(app, /标签排行/);
+  assert.doesNotMatch(app, /XLSX|parseMatrix|自动关联|导出 CSV|消费整理/);
 });

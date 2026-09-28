@@ -1,10 +1,9 @@
 {
   "name": "koin",
-  "version": "0.1.0",
-  "description": "本机优先的个人消费账本桌面应用",
+  "version": "0.3.0",
+  "description": "本机优先的个人账单可视化工具",
   "author": "AprIsYourLie",
   "private": true,
-  "main": "desktop/main.mjs",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -12,25 +11,24 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "desktop": "npm run build && electron desktop/main.mjs",
-    "desktop:dir": "npm run build && electron-builder --win dir",
-    "desktop:installer": "npm run build && electron-builder --win nsis",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/desktop-shell.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern release"
+    "desktop": "tauri dev",
+    "desktop:portable": "tauri build --no-bundle && node scripts/copy-portable.mjs",
+    "desktop:installer": "tauri build --bundles nsis",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern release --ignore-pattern src-tauri/target"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.12.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "xlsx": "^0.18.5"
+    "react-dom": "19.2.6"
   },
   "devDependencies": {
     "@eslint/js": "9.39.4",
+    "@tauri-apps/cli": "^2.12.0",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
-    "electron": "^44.2.0",
-    "electron-builder": "^26.15.3",
     "eslint": "9.39.4",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react": "7.37.5",
@@ -40,41 +38,5 @@
     "typescript-eslint": "8.59.3",
     "vite": "8.0.13"
   },
-  "type": "module",
-  "build": {
-    "appId": "com.aprisyourlie.koin",
-    "productName": "Koin",
-    "asar": true,
-    "asarUnpack": [
-      "dist/**/*"
-    ],
-    "directories": {
-      "output": "release",
-      "buildResources": "build"
-    },
-    "files": [
-      "desktop/**/*",
-      "dist/**/*",
-      "package.json"
-    ],
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ],
-      "icon": "build/koin-icon.png",
-      "artifactName": "Koin-Setup-${version}-${arch}.${ext}"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Koin"
-    }
-  }
+  "type": "module"
 }
