@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { counts, createBook, displayTransaction, monthEnd, netExpense, planImport, readBook } from "../app/billModel.ts";
+import { assignGroup, counts, createBook, displayTransaction, mergeGroups, monthEnd, netExpense, planImport, readBook, transactionSources } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
 
@@ -55,4 +55,42 @@ test("rejects invalid records without silently creating duplicates", () => {
 test("meaningful note is the title, generic note is not", () => {
   assert.deepEqual(displayTransaction(expense("one", "2026-07-01")), { title: "晚餐", merchant: "美团" });
   assert.deepEqual(displayTransaction(expense("two", "2026-07-01", { note: "扫码支付" })), { title: "美团", merchant: undefined });
+});
+
+test("traces merged platform and bank sources without repeated wallet aliases", () => {
+  const item = expense("linked", "2026-09-01", { source: "美团", evidence: [{ source: "微信支付" }, { source: "微信" }, { source: "建设银行" }, null, {}, { source: 3 }] });
+  assert.deepEqual(transactionSources(item), ["美团", "微信", "建设银行"]);
+  assert.deepEqual(transactionSources(expense("manual", "2026-09-01", { source: "手动" })), ["手动记录"]);
+  assert.deepEqual(transactionSources(expense("missing", "2026-09-01")), ["整理导入"]);
+});
+
+test("moves selected purchases and refunds between folders without changing their accounting", () => {
+  const original = [expense("pan", "2026-09-01", { amount: 100, category: "购物" }), expense("refund", "2026-10-01", { amount: 20, kind: "refund" }), expense("transfer", "2026-09-02", { kind: "transfer", amount: 500 }), expense("other", "2026-09-03")];
+  const grouped = assignGroup(original, ["pan", "refund", "transfer"], "kitchen");
+  assert.equal(netExpense(grouped.filter((item) => item.groupIds?.includes("kitchen"))), 80);
+  assert.equal(grouped[0].category, "购物");
+  assert.deepEqual(grouped[0].tags, original[0].tags);
+  assert.equal(original[0].groupIds, undefined);
+  const moved = assignGroup(grouped, ["pan", "refund"], "home");
+  assert.deepEqual(moved[0].groupIds, ["home"]);
+  assert.equal(netExpense(moved), netExpense(original));
+  assert.equal(netExpense(moved.filter((item) => item.groupIds?.includes("kitchen"))), 0);
+  assert.deepEqual(assignGroup(moved, ["pan"], "home", true)[0].groupIds, []);
+});
+
+test("folder backups restore memberships, empty folders and duplicate imports preserve local organization", () => {
+  const groups = [{ id: "kitchen", name: "厨具购买" }, { id: "empty", name: "旅行" }];
+  const records = assignGroup([expense("sept", "2026-09-01"), expense("oct", "2026-10-01")], ["sept", "oct"], "kitchen");
+  const monthly = readBook(JSON.parse(JSON.stringify(createBook(records.slice(0, 1), groups))));
+  assert.deepEqual(monthly.groups, groups);
+  assert.deepEqual(monthly.transactions[0].groupIds, ["kitchen"]);
+  const whole = readBook(createBook(records, groups));
+  assert.equal(netExpense(whole.transactions.filter((item) => item.groupIds?.includes("kitchen"))), 56);
+  const localGroups = [{ id: "kitchen", name: "我改过的组名" }];
+  const plan = planImport(assignGroup(records, ["sept"], "empty"), createBook(records, groups), localGroups);
+  assert.equal(plan.added.length, 0);
+  assert.equal(plan.duplicates, 2);
+  assert.deepEqual(mergeGroups(localGroups, plan.groups), [localGroups[0], groups[1]]);
+  assert.deepEqual(planImport([], createBook([], groups)).groups, groups);
+  assert.equal(readBook({ version: 4, transactions: [{ ...records[0], groupIds: ["missing"] }], groups }).invalid, 1);
 });

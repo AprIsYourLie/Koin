@@ -1,9 +1,9 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction,
-  monthEnd, netExpense, planImport, readBook,
-  type ImportPreview, type Kind, type Transaction,
+  assignGroup, mergeGroups, monthEnd, netExpense, planImport, readBook, transactionSources,
+  type ImportPreview, type Kind, type Transaction, type PurposeGroup,
 } from "./billModel";
 
 type View = "overview" | "details" | "data";
@@ -36,17 +36,18 @@ function yuan(value: number) {
   return value.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function loadSaved(): Transaction[] {
+function loadSaved() {
   try {
     const saved = localStorage.getItem(STORE_KEY);
-    return saved ? readBook(JSON.parse(saved)).transactions.filter((item) => !item.id.startsWith("demo-")) : [];
+    const book = readBook(saved ? JSON.parse(saved) : []);
+    return { ...book, transactions: book.transactions.filter((item) => !item.id.startsWith("demo-")) };
   } catch {
-    return [];
+    return readBook([]);
   }
 }
 
-async function downloadBook(items: Transaction[], fileName: string): Promise<boolean> {
-  const content = JSON.stringify(createBook(items), null, 2);
+async function downloadBook(items: Transaction[], fileName: string, groups: PurposeGroup[]): Promise<boolean> {
+  const content = JSON.stringify(createBook(items, groups), null, 2);
   if (isTauri()) return invoke<boolean>("save_book_json", { fileName, content });
   const blob = new Blob([content], { type: "application/json;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -69,9 +70,11 @@ function monthItems(items: Transaction[], month: string) {
 }
 
 export default function KoinApp() {
-  const [transactions, setTransactions] = useState<Transaction[]>(loadSaved);
+  const [saved] = useState(loadSaved);
+  const [transactions, setTransactions] = useState<Transaction[]>(saved.transactions);
+  const [groups, setGroups] = useState<PurposeGroup[]>(saved.groups);
   const [month, setMonth] = useState(() => {
-    const latest = loadSaved().map((item) => item.date.slice(0, 7)).sort().at(-1);
+    const latest = saved.transactions.map((item) => item.date.slice(0, 7)).sort().at(-1);
     return latest ?? monthNow();
   });
   const [view, setView] = useState<View>("overview");
@@ -81,8 +84,8 @@ export default function KoinApp() {
   const [toast, setToast] = useState("");
 
   useEffect(() => {
-    localStorage.setItem(STORE_KEY, JSON.stringify(transactions));
-  }, [transactions]);
+    localStorage.setItem(STORE_KEY, JSON.stringify(createBook(transactions, groups)));
+  }, [transactions, groups]);
 
   useEffect(() => {
     if (!toast) return;
@@ -112,6 +115,7 @@ export default function KoinApp() {
   }
 
   function completeImport(preview: ImportPreview) {
+    setGroups((currentGroups) => mergeGroups(currentGroups, preview.groups));
     setTransactions((currentItems) => {
       const known = new Set(currentItems.map((item) => item.id));
       return [...currentItems, ...preview.added.filter((item) => !known.has(item.id))];
@@ -145,10 +149,18 @@ export default function KoinApp() {
 
       <div className="content">
         {view === "overview" && <Overview current={current} all={transactions} month={month} onImport={() => setImportOpen(true)} onDetails={openDetails} />}
-        {view === "details" && <Details key={month} items={current} month={month} initialFilter={detailFilter} onEdit={setEditing} onAdd={() => setEditing(null)} />}
-        {view === "data" && <DataView key={month} items={transactions} month={month} onImport={() => setImportOpen(true)} onClear={() => {
+        {view === "details" && <Details key={month} items={transactions} groups={groups} month={month} initialFilter={detailFilter} onEdit={setEditing} onAdd={() => setEditing(null)} onGroupSave={(group) => setGroups((old) => old.some((item) => item.id === group.id) ? old.map((item) => item.id === group.id ? group : item) : [...old, group])} onGroupDelete={(id) => {
+          if (!window.confirm("删除这个分组？组内账单会回到未分组列表。")) return;
+          setGroups((old) => old.filter((group) => group.id !== id));
+          setTransactions((old) => assignGroup(old, old.map((item) => item.id), id, true));
+        }} onAssign={(ids, groupId, remove = false) => {
+          if (!groups.some((group) => group.id === groupId)) return;
+          setTransactions((old) => assignGroup(old, ids, groupId, remove));
+          setToast(remove ? "已移出分组" : "已整理到分组");
+        }} />}
+        {view === "data" && <DataView key={month} items={transactions} groups={groups} month={month} onImport={() => setImportOpen(true)} onClear={() => {
           if (!window.confirm("确定清空本机账本吗？建议先导出整本备份，此操作无法撤销。")) return;
-          setTransactions([]); setToast("账本已清空");
+          setTransactions([]); setGroups([]); setToast("账本已清空");
         }} onExport={(count) => setToast(`已导出 ${count} 条记录`)} />}
       </div>
     </main>
@@ -159,7 +171,7 @@ export default function KoinApp() {
       <Nav active={view === "data"} icon="↧" label="数据" onClick={() => setView("data")} />
     </nav>
 
-    {importOpen && <ImportDialog existing={transactions} onClose={() => setImportOpen(false)} onComplete={completeImport} />}
+    {importOpen && <ImportDialog existing={transactions} groups={groups} onClose={() => setImportOpen(false)} onComplete={completeImport} />}
     {editing !== undefined && <Editor key={editing?.id ?? "new"} initial={editing} month={month} onClose={() => setEditing(undefined)} onSave={save} onDelete={editing ? () => remove(editing.id) : undefined} />}
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
@@ -229,40 +241,168 @@ function TransactionLine({ item, onClick }: { item: Transaction; onClick: () => 
   return <button className="transaction-line" onClick={onClick}><span className="category-icon" style={{ color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{initials(item.category)}</span><span className="transaction-main"><strong>{display.title}</strong><small>{display.merchant ? `${display.merchant} · ` : ""}{item.date} · {item.category}{item.counted === false ? " · 不计入" : ""}</small></span><b className={item.kind === "refund" || item.kind === "income" ? "positive" : ""}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{yuan(item.amount)}</b></button>;
 }
 
-function Details({ items, month, initialFilter, onEdit, onAdd }: { items: Transaction[]; month: string; initialFilter: DetailFilter; onEdit: (item: Transaction) => void; onAdd: () => void }) {
+function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSave, onGroupDelete, onAssign }: {
+  items: Transaction[]; groups: PurposeGroup[]; month: string; initialFilter: DetailFilter;
+  onEdit: (item: Transaction) => void; onAdd: () => void;
+  onGroupSave: (group: PurposeGroup) => void; onGroupDelete: (id: string) => void;
+  onAssign: (ids: string[], groupId: string, remove?: boolean) => void;
+}) {
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState(initialFilter.category ?? "");
   const [merchant, setMerchant] = useState(initialFilter.merchant ?? "");
   const [tag, setTag] = useState(initialFilter.tag ?? "");
+  const [source, setSource] = useState("");
+  const [scope, setScope] = useState<"month" | "range" | "all">("month");
+  const [start, setStart] = useState(month);
+  const [end, setEnd] = useState(month);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const categories = [...new Set(items.map((item) => item.category))].sort();
-  const merchants = [...new Set(items.map((item) => item.merchant))].sort();
-  const tags = [...new Set(items.flatMap((item) => item.tags ?? []))].sort();
-  const visible = items.filter((item) => {
-    const searchable = [item.merchant, item.note, item.category, item.source, ...(item.tags ?? [])].join(" ").toLowerCase();
-    return (!query || searchable.includes(query.trim().toLowerCase())) && (!category || item.category === category) && (!merchant || item.merchant === merchant) && (!tag || item.tags?.includes(tag));
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [groupName, setGroupName] = useState("");
+  const [editingGroup, setEditingGroup] = useState<string | null>(null);
+  const [groupError, setGroupError] = useState("");
+  const [dragOver, setDragOver] = useState<string | null>(null);
+  const [draggedCount, setDraggedCount] = useState(0);
+  const pointerDrag = useRef<{ ids: string[]; pointerId: number; x: number; y: number; moved: boolean } | null>(null);
+  const validRange = scope !== "range" || Boolean(start && end && start <= end);
+  const scoped = items.filter((item) => validRange && (scope === "all" || (item.date.slice(0, 7) >= (scope === "month" ? month : start) && item.date.slice(0, 7) <= (scope === "month" ? month : end))));
+  const categories = [...new Set(scoped.map((item) => item.category))].sort();
+  const merchants = [...new Set(scoped.map((item) => item.merchant))].sort();
+  const tags = [...new Set(scoped.flatMap((item) => item.tags ?? []))].sort();
+  const sources = [...new Set(scoped.flatMap(transactionSources))].sort();
+  const visible = scoped.filter((item) => {
+    const names = groups.filter((group) => item.groupIds?.includes(group.id)).map((group) => group.name);
+    const itemSources = transactionSources(item);
+    const searchable = [item.merchant, item.note, item.category, ...itemSources, ...(item.tags ?? []), ...names].join(" ").toLowerCase();
+    return (!query || searchable.includes(query.trim().toLowerCase())) && (!category || item.category === category) && (!merchant || item.merchant === merchant) && (!tag || item.tags?.includes(tag)) && (!source || itemSources.includes(source));
   }).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id));
   const selectedItems = items.filter((item) => selected.has(item.id));
   const allVisibleSelected = visible.length > 0 && visible.every((item) => selected.has(item.id));
-  const days = [...new Set(visible.map((item) => item.date))];
+  const ungrouped = visible.filter((item) => !groups.some((group) => item.groupIds?.includes(group.id)));
 
   function toggle(id: string) {
     setSelected((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   }
-
   function toggleVisible() {
     setSelected((current) => { const next = new Set(current); for (const item of visible) if (allVisibleSelected) next.delete(item.id); else next.add(item.id); return next; });
   }
+  function toggleGroup(id: string) {
+    setExpanded((old) => { const next = new Set(old); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  }
+  function saveGroup(event: FormEvent) {
+    event.preventDefault();
+    const name = groupName.trim();
+    if (!name) { setGroupError("请输入分组名称"); return; }
+    if (groups.some((group) => group.name === name && group.id !== editingGroup)) { setGroupError("这个分组名称已存在"); return; }
+    const id = editingGroup ?? crypto.randomUUID();
+    onGroupSave({ id, name });
+    setExpanded((old) => new Set([...old, id]));
+    setEditingGroup(null); setGroupName(""); setGroupError("");
+  }
+  function drop(event: DragEvent, groupId: string) {
+    event.preventDefault(); setDragOver(null);
+    try {
+      const ids: unknown = JSON.parse(event.dataTransfer.getData("application/x-koin-transactions"));
+      if (Array.isArray(ids) && ids.every((id) => typeof id === "string") && ids.length) onAssign(ids, groupId);
+    } catch { /* Ignore files and other external drag data. */ }
+  }
+  function pointerStart(event: PointerEvent<HTMLButtonElement>, item: Transaction) {
+    if (event.button !== 0 || !event.isPrimary || pointerDrag.current) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const ids = selected.has(item.id) ? selectedItems.map((record) => record.id) : [item.id];
+    pointerDrag.current = { ids, pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+  }
+  function pointerMove(event: PointerEvent<HTMLButtonElement>) {
+    const drag = pointerDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 6 && !drag.moved) return;
+    drag.moved = true;
+    setDraggedCount(drag.ids.length);
+    const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
+    setDragOver(folder?.dataset.groupId ?? null);
+    if (event.clientY < 100) window.scrollBy(0, -30);
+    else if (event.clientY > window.innerHeight - 60) window.scrollBy(0, 30);
+  }
+  function pointerFinish(event: PointerEvent<HTMLButtonElement>, cancelled = false) {
+    const drag = pointerDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return false;
+    pointerDrag.current = null;
+    setDraggedCount(0); setDragOver(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
+    if (!cancelled && drag?.moved && folder?.dataset.groupId) onAssign(drag.ids, folder.dataset.groupId);
+    return drag.moved;
+  }
+  const rowProps = { selected, onToggle: toggle, onEdit, onAssign, onPointerStart: pointerStart, onPointerMove: pointerMove, onPointerFinish: pointerFinish };
 
   return <div className="details-page">
-    <div className="view-heading"><div><span className="eyebrow">账单明细</span><h1>{formatMonth(month)}</h1><p>按日期查看、筛选和临时统计。</p></div><button className="secondary" onClick={onAdd}>补记一笔</button></div>
-    <section className="panel filter-panel"><div className="filters"><input type="search" placeholder="搜索商品、商家、备注或来源" value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div><div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span><button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); }}>清除筛选</button></div></section>
-    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
-    <section className="panel day-list">{days.length ? days.map((day) => <div className="day-group" key={day}><div className="day-heading"><strong>{day.slice(5).replace("-", " 月 ")} 日</strong><span>净消费 ¥{yuan(netExpense(visible.filter((item) => item.date === day)))}</span></div>{visible.filter((item) => item.date === day).map((item) => { const display = displayTransaction(item); return <div className="detail-row" key={item.id}><input type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} aria-label={`勾选 ${display.title}`} /><button className="detail-content" onClick={() => onEdit(item)}><span className="category-icon" style={{ color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{initials(item.category)}</span><span className="transaction-main"><strong>{display.title}</strong><small>{display.merchant ? `${display.merchant} · ` : ""}{item.category} · {KIND_NAMES[item.kind]}{!counts(item) ? " · 不计入" : ""}</small>{item.tags?.length ? <span className="tag-list">{item.tags.map((name) => <em key={name}>#{name}</em>)}</span> : null}</span><b className={item.kind === "refund" || item.kind === "income" ? "positive" : ""}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{yuan(item.amount)}</b></button></div>; })}</div>) : <p className="small-empty">这个月份或筛选条件下没有记录</p>}</section>
+    {draggedCount > 0 && <div className="drag-status" role="status">正在拖动 {draggedCount} 条账单 · 松开到分组中</div>}
+    <div className="view-heading"><div><span className="eyebrow">账单整理</span><h1>{scope === "month" ? formatMonth(month) : scope === "all" ? "全部月份" : "月份范围"}</h1><p>分好组的放在上面，其他账单在下面继续整理。</p></div><button className="secondary" onClick={onAdd}>补记一笔</button></div>
+    <section className="panel filter-panel">
+      <div className="organize-period"><label>查看范围 <select aria-label="查看月份范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="month">当前月份</option><option value="range">连续多月</option><option value="all">全部月份</option></select></label>{scope === "range" && <><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></>}{!validRange && <span role="alert">请选择有效的月份范围</span>}</div>
+      <div className="filters"><input type="search" placeholder="搜索商品、商家、来源或分组" value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div>
+      <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span><button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button></div>
+    </section>
+    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !groups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{groups.map((group) => <option value={group.id} key={group.id}>{group.name}</option>)}</select><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
+    <section className="purpose-groups" aria-label="用途分组">
+      <div className="group-section-heading"><h2>用途分组</h2><span>拖入单条账单，或勾选后一起拖入</span></div>
+      <form className="group-create" onSubmit={saveGroup}><input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "新建分组"}</button>{editingGroup && <button type="button" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button>}</form>
+      {groupError && <p className="import-error" role="alert">{groupError}</p>}
+      {groups.map((group) => {
+        const records = visible.filter((item) => item.groupIds?.includes(group.id));
+        const total = netExpense(items.filter((item) => item.groupIds?.includes(group.id)));
+        return <section key={group.id} data-group-id={group.id} className={`panel purpose-folder${dragOver === group.id ? " drag-over" : ""}`} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDragOver(group.id); } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragOver(null); }} onDrop={(event) => drop(event, group.id)}>
+          <div className="folder-heading"><button className="folder-toggle" aria-expanded={expanded.has(group.id)} onClick={() => toggleGroup(group.id)}><span aria-hidden="true">{expanded.has(group.id) ? "▾" : "▸"} ▰</span><strong>{group.name}</strong><span>{records.length} 笔</span><b>¥{yuan(netExpense(records))}</b></button><div className="folder-actions"><button onClick={() => setSelected((old) => new Set([...old, ...records.map((item) => item.id)]))} disabled={!records.length}>勾选组内</button><button onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); }}>改名</button><button onClick={() => onGroupDelete(group.id)}>删除分组</button></div></div>
+          <div className="folder-caption">当前范围净消费 · 全部月份累计 ¥{yuan(total)}</div>
+          {expanded.has(group.id) && <div className="folder-records">{records.length ? <BillRows records={records} groupId={group.id} {...rowProps} /> : <p className="small-empty">当前范围没有账单，可以拖入账单到这个分组。</p>}</div>}
+        </section>;
+      })}
+    </section>
+    <section className="panel day-list"><div className="ungrouped-heading"><h2>未分组账单</h2><span>{ungrouped.length} 笔 · 净消费 ¥{yuan(netExpense(ungrouped))}</span></div>{ungrouped.length ? <BillRows records={ungrouped} {...rowProps} /> : <p className="small-empty">当前范围没有未分组账单</p>}</section>
+  </div>;
+}
+type BillRowActions = {
+  onToggle: (id: string) => void; onEdit: (item: Transaction) => void;
+  onAssign: (ids: string[], groupId: string, remove?: boolean) => void;
+  onPointerStart: (event: PointerEvent<HTMLButtonElement>, item: Transaction) => void;
+  onPointerMove: (event: PointerEvent<HTMLButtonElement>) => void;
+  onPointerFinish: (event: PointerEvent<HTMLButtonElement>, cancelled?: boolean) => boolean;
+};
+
+function BillRows({ records, groupId, selected, ...actions }: BillRowActions & {
+  records: Transaction[]; groupId?: string; selected: Set<string>;
+}) {
+    const days = [...new Set(records.map((item) => item.date))];
+    return days.map((day) => <div className="day-group" key={day}>
+      <div className="day-heading"><strong>{day}</strong><span>净消费 ¥{yuan(netExpense(records.filter((item) => item.date === day)))}</span></div>
+      {records.filter((item) => item.date === day).map((item) => <BillRow key={item.id} item={item} groupId={groupId} selected={selected.has(item.id)} {...actions} />)}
+    </div>);
+
+}
+
+function BillRow({ item, groupId, selected, onToggle, onEdit, onAssign, onPointerStart, onPointerMove, onPointerFinish }: BillRowActions & {
+  item: Transaction; groupId?: string; selected: boolean;
+}) {
+  const display = displayTransaction(item);
+  const sources = transactionSources(item).join(" · ");
+  const suppressClick = useRef(false);
+  return <div className={`detail-row${selected ? " is-selected" : ""}`}>
+    <button type="button" className="detail-select" aria-pressed={selected} aria-label={`${selected ? "取消勾选" : "勾选"} ${display.title}`} onClick={(event) => {
+      if (!suppressClick.current || event.detail === 0) onToggle(item.id);
+      suppressClick.current = false;
+    }} onPointerDown={(event) => { suppressClick.current = false; onPointerStart(event, item); }} onPointerMove={onPointerMove} onPointerUp={(event) => { suppressClick.current = onPointerFinish(event); }} onPointerCancel={(event) => { suppressClick.current = onPointerFinish(event, true); }}>
+      <span className="drag-handle" aria-hidden="true">⠿</span>
+      <span className="row-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+      <span className="detail-content">
+        <span className="category-icon" style={{ color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{initials(item.category)}</span>
+        <span className="transaction-main"><strong>{display.title}</strong><small>{display.merchant ? `${display.merchant} · ` : ""}{item.category} · {KIND_NAMES[item.kind]}{!counts(item) ? " · 不计入" : ""}</small><small className="transaction-source" title={`来源：${sources}`}>来源：{sources}</small>{item.tags?.length ? <span className="tag-list">{item.tags.map((name) => <em key={name}>#{name}</em>)}</span> : null}</span>
+        <b className={item.kind === "refund" || item.kind === "income" ? "positive" : ""}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{yuan(item.amount)}</b>
+      </span>
+    </button>
+    <div className="row-actions"><button type="button" onClick={() => onEdit(item)} aria-label={`编辑 ${display.title}`}>编辑</button>{groupId && <button type="button" onClick={() => onAssign([item.id], groupId, true)} aria-label={`将 ${display.title} 移出分组`}>移出</button>}</div>
   </div>;
 }
 
-function DataView({ items, month, onImport, onClear, onExport }: { items: Transaction[]; month: string; onImport: () => void; onClear: () => void; onExport: (count: number) => void }) {
+function DataView({ items, groups, month, onImport, onClear, onExport }: { items: Transaction[]; groups: PurposeGroup[]; month: string; onImport: () => void; onClear: () => void; onExport: (count: number) => void }) {
   const [scope, setScope] = useState<"month" | "range" | "all">("month");
   const [start, setStart] = useState(month);
   const [end, setEnd] = useState(month);
@@ -276,7 +416,7 @@ function DataView({ items, month, onImport, onClear, onExport }: { items: Transa
     setExportError("");
     setExporting(true);
     try {
-      if (await downloadBook(selected, `Koin账本_${suffix}.json`)) onExport(selected.length);
+      if (await downloadBook(selected, `Koin账本_${suffix}.json`, groups)) onExport(selected.length);
     } catch (error) {
       setExportError(`导出失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -284,10 +424,10 @@ function DataView({ items, month, onImport, onClear, onExport }: { items: Transa
     }
   }
 
-  return <div className="data-page"><div className="view-heading"><div><span className="eyebrow">本机数据</span><h1>导入与备份</h1><p>由我整理 JSON，你导入查看；修改后再导出最终账本。</p></div></div><div className="data-grid"><section className="panel data-card"><span className="card-icon">↥</span><h2>导入 Koin JSON</h2><p>可一次导入一个或多个自然月。已有 ID 保留本机修改，只补入缺少的记录。</p><button className="primary" onClick={onImport}>选择 JSON 文件</button></section><section className="panel data-card"><span className="card-icon">↓</span><h2>导出整理后的 JSON</h2><p>包括补记和修改；导出的文件可重新导入 Koin。</p><div className="scope-options"><label><input type="radio" checked={scope === "month"} onChange={() => setScope("month")} /> 当前月份</label><label><input type="radio" checked={scope === "range"} onChange={() => setScope("range")} /> 连续多月</label><label><input type="radio" checked={scope === "all"} onChange={() => setScope("all")} /> 整本账本</label></div>{scope === "range" && <div className="month-range"><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></div>}<div className="export-count">将导出 {validRange ? selected.length : 0} 条记录{!validRange ? " · 起始月份不能晚于结束月份" : ""}</div>{exportError && <p className="import-error" role="alert">{exportError}</p>}<button className="primary" disabled={!validRange || !selected.length || exporting} onClick={exportSelected}>{exporting ? "正在导出…" : "导出 JSON"}</button></section></div><section className="panel storage-note"><div><h2>本机账本</h2><p>当前保存 {items.length} 条记录。更换电脑或卸载前，请导出整本账本备份。</p></div><button onClick={onClear}>清空本机账本</button></section></div>;
+  return <div className="data-page"><div className="view-heading"><div><span className="eyebrow">本机数据</span><h1>导入与备份</h1><p>由我整理 JSON，你导入查看；修改后再导出最终账本。</p></div></div><div className="data-grid"><section className="panel data-card"><span className="card-icon">↥</span><h2>导入 Koin JSON</h2><p>可一次导入一个或多个自然月。已有 ID 保留本机修改，只补入缺少的记录。</p><button className="primary" onClick={onImport}>选择 JSON 文件</button></section><section className="panel data-card"><span className="card-icon">↓</span><h2>导出整理后的 JSON</h2><p>包括补记和修改；导出的文件可重新导入 Koin。</p><div className="scope-options"><label><input type="radio" checked={scope === "month"} onChange={() => setScope("month")} /> 当前月份</label><label><input type="radio" checked={scope === "range"} onChange={() => setScope("range")} /> 连续多月</label><label><input type="radio" checked={scope === "all"} onChange={() => setScope("all")} /> 整本账本</label></div>{scope === "range" && <div className="month-range"><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></div>}<div className="export-count">将导出 {validRange ? selected.length : 0} 条记录{!validRange ? " · 起始月份不能晚于结束月份" : ""}</div>{exportError && <p className="import-error" role="alert">{exportError}</p>}<button className="primary" disabled={!validRange || (!selected.length && !groups.length) || exporting} onClick={exportSelected}>{exporting ? "正在导出…" : "导出 JSON"}</button></section></div><section className="panel storage-note"><div><h2>本机账本</h2><p>当前保存 {items.length} 条记录。更换电脑或卸载前，请导出整本账本备份。</p></div><button onClick={onClear}>清空本机账本</button></section></div>;
 }
 
-function ImportDialog({ existing, onClose, onComplete }: { existing: Transaction[]; onClose: () => void; onComplete: (preview: ImportPreview) => void }) {
+function ImportDialog({ existing, groups, onClose, onComplete }: { existing: Transaction[]; groups: PurposeGroup[]; onClose: () => void; onComplete: (preview: ImportPreview) => void }) {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [fileNames, setFileNames] = useState("");
   const [error, setError] = useState("");
@@ -299,21 +439,23 @@ function ImportDialog({ existing, onClose, onComplete }: { existing: Transaction
     setError(""); setPreview(null); setFileNames(files.map((file) => file.name).join("、"));
     try {
       const records: Transaction[] = [];
+      let importedGroups: PurposeGroup[] = [];
       let invalid = 0; let total = 0;
       for (const file of files) {
         if (!file.name.toLowerCase().endsWith(".json")) throw new Error(`${file.name} 不是 JSON 文件`);
         const parsed = readBook(JSON.parse(await file.text()));
         records.push(...parsed.transactions);
+        importedGroups = mergeGroups(importedGroups, parsed.groups);
         invalid += parsed.invalid; total += parsed.total;
       }
-      const plan = planImport(existing, records);
+      const plan = planImport(existing, { transactions: records, groups: importedGroups }, groups);
       setPreview({ ...plan, invalid: plan.invalid + invalid, total });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "文件读取失败，请检查 JSON 格式");
     }
   }
 
-  return <Modal title="导入 Koin JSON" onClose={onClose}><div className="import-dialog"><p>选择我整理好的 JSON，或之前从 Koin 导出的完整备份。可以同时选择多个文件。</p><label className="file-picker">选择 JSON 文件<input type="file" accept=".json,application/json" multiple onChange={readFiles} /></label>{fileNames && <small className="file-name">{fileNames}</small>}{error && <p className="import-error" role="alert">{error}</p>}{preview && <><div className="import-preview"><div><span>月份范围</span><strong>{preview.months.length ? `${formatMonth(preview.months[0])} — ${formatMonth(preview.months.at(-1)!)}` : "无有效记录"}</strong></div><div><span>新增</span><strong>{preview.added.length} 条</strong></div><div><span>重复 ID</span><strong>{preview.duplicates} 条</strong></div><div><span>无效记录</span><strong>{preview.invalid} 条</strong></div></div><p className="import-hint">重复 ID 保留 Koin 中的版本；无效记录不会导入。共读取 {preview.total} 条。</p></>}<div className="modal-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={!preview?.added.length} onClick={() => preview && onComplete(preview)}>确认导入</button></div></div></Modal>;
+  return <Modal title="导入 Koin JSON" onClose={onClose}><div className="import-dialog"><p>选择我整理好的 JSON，或之前从 Koin 导出的完整备份。可以同时选择多个文件。</p><label className="file-picker">选择 JSON 文件<input type="file" accept=".json,application/json" multiple onChange={readFiles} /></label>{fileNames && <small className="file-name">{fileNames}</small>}{error && <p className="import-error" role="alert">{error}</p>}{preview && <><div className="import-preview"><div><span>月份范围</span><strong>{preview.months.length ? `${formatMonth(preview.months[0])} — ${formatMonth(preview.months.at(-1)!)}` : "无有效记录"}</strong></div><div><span>新增</span><strong>{preview.added.length} 条</strong></div><div><span>重复 ID</span><strong>{preview.duplicates} 条</strong></div><div><span>无效记录</span><strong>{preview.invalid} 条</strong></div></div><p className="import-hint">重复 ID 保留 Koin 中的版本；无效记录不会导入。共读取 {preview.total} 条，新增 {preview.groups.length} 个用途分组。</p></>}<div className="modal-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={!preview || (!preview.added.length && !preview.groups.length)} onClick={() => preview && onComplete(preview)}>确认导入</button></div></div></Modal>;
 }
 
 function Editor({ initial, month, onClose, onSave, onDelete }: { initial: Transaction | null; month: string; onClose: () => void; onSave: (item: Transaction) => void; onDelete?: () => void }) {

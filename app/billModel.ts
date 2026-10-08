@@ -1,4 +1,5 @@
 export type Kind = "expense" | "refund" | "income" | "repayment" | "transfer";
+export type PurposeGroup = { id: string; name: string };
 
 export type Transaction = {
   id: string;
@@ -9,6 +10,7 @@ export type Transaction = {
   kind: Kind;
   note?: string;
   tags?: string[];
+  groupIds?: string[];
   source?: string;
   payment?: string;
   fundingAccount?: string;
@@ -21,6 +23,7 @@ export type Transaction = {
 
 export type ImportPreview = {
   added: Transaction[];
+  groups: PurposeGroup[];
   duplicates: number;
   invalid: number;
   months: string[];
@@ -42,6 +45,14 @@ export function displayTransaction(item: Transaction) {
   const note = item.note?.replace(/^导入行\s*\d+\s*(?:[·•｜|—-]\s*)?/, "").trim();
   const product = (item.kind === "expense" || item.kind === "refund") && note && !GENERIC_NOTES.test(note) && note !== item.merchant ? note : undefined;
   return { title: product ?? item.merchant, merchant: product ? item.merchant : undefined };
+}
+
+export function transactionSources(item: Transaction) {
+  const aliases: Record<string, string> = { 微信支付: "微信", WeChat: "微信", 支付宝支付: "支付宝", Alipay: "支付宝", 抖音支付: "抖音", 手动: "手动记录" };
+  const sources = [item.source, ...(item.evidence ?? []).map((entry) => entry && typeof entry === "object" && "source" in entry ? entry.source : undefined)]
+    .filter((source): source is string => typeof source === "string" && Boolean(source.trim()))
+    .map((source) => aliases[source.trim()] ?? source.trim());
+  return [...new Set(sources.length ? sources : ["整理导入"])];
 }
 
 export function counts(item: Transaction) {
@@ -71,28 +82,45 @@ function record(value: unknown): Transaction | null {
   if (typeof item.amount !== "number" || !Number.isFinite(item.amount) || item.amount <= 0 || !KINDS.includes(item.kind as Kind)) return null;
   if (item.counted !== undefined && typeof item.counted !== "boolean") return null;
   if (item.tags !== undefined && (!Array.isArray(item.tags) || item.tags.some((tag) => typeof tag !== "string"))) return null;
+  if (item.groupIds !== undefined && (!Array.isArray(item.groupIds) || item.groupIds.some((id) => typeof id !== "string" || !id.trim()))) return null;
   return {
     ...item,
     id: item.id.trim(),
     merchant: item.merchant.trim(),
     category: typeof item.category === "string" && item.category.trim() ? item.category.trim() : "其他",
     tags: [...new Set(((item.tags as string[] | undefined) ?? []).map((tag) => tag.trim()).filter(Boolean))],
+    groupIds: [...new Set((item.groupIds as string[] | undefined) ?? [])],
     source: typeof item.source === "string" ? item.source : "整理导入",
     payment: typeof item.payment === "string" ? item.payment : "",
     note: typeof item.note === "string" ? item.note : undefined,
   } as Transaction;
 }
 
-export function readBook(value: unknown): { transactions: Transaction[]; invalid: number; total: number } {
-  const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 3)) throw new Error("不支持此 JSON 版本");
-  const rows = Array.isArray(value) ? value : document?.transactions;
-  if (!Array.isArray(rows)) throw new Error("JSON 中没有 transactions 记录列表");
-  const parsed = rows.map(record);
-  return { transactions: parsed.filter((item): item is Transaction => item !== null), invalid: parsed.filter((item) => item === null).length, total: rows.length };
+export function mergeGroups(existing: PurposeGroup[], incoming: PurposeGroup[]) {
+  const merged = new Map(existing.map((group) => [group.id, group]));
+  for (const group of incoming) if (!merged.has(group.id)) merged.set(group.id, group);
+  return [...merged.values()];
 }
 
-export function planImport(existing: Transaction[], document: unknown): ImportPreview {
+export function assignGroup(items: Transaction[], ids: string[], groupId: string, remove = false) {
+  const selected = new Set(ids);
+  return items.map((item) => selected.has(item.id) ? { ...item, groupIds: remove ? (item.groupIds ?? []).filter((id) => id !== groupId) : [groupId] } : item);
+}
+
+export function readBook(value: unknown): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
+  const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 4)) throw new Error("不支持此 JSON 版本");
+  const rows = Array.isArray(value) ? value : document?.transactions;
+  if (!Array.isArray(rows)) throw new Error("JSON 中没有 transactions 记录列表");
+  const rawGroups = document?.groups ?? [];
+  if (!Array.isArray(rawGroups) || rawGroups.some((group) => !group || typeof group.id !== "string" || !group.id.trim() || typeof group.name !== "string" || !group.name.trim())) throw new Error("用途分组格式无效");
+  const groups = mergeGroups([], rawGroups.map((group) => ({ id: group.id.trim(), name: group.name.trim() })));
+  const knownGroups = new Set(groups.map((group) => group.id));
+  const parsed = rows.map(record).map((item) => item?.groupIds?.some((id) => !knownGroups.has(id)) ? null : item);
+  return { transactions: parsed.filter((item): item is Transaction => item !== null), groups, invalid: parsed.filter((item) => item === null).length, total: rows.length };
+}
+
+export function planImport(existing: Transaction[], document: unknown, existingGroups: PurposeGroup[] = []): ImportPreview {
   const parsed = readBook(document);
   const known = new Set(existing.map((item) => item.id));
   const added: Transaction[] = [];
@@ -101,9 +129,9 @@ export function planImport(existing: Transaction[], document: unknown): ImportPr
     if (known.has(item.id)) duplicates++;
     else { added.push(item); known.add(item.id); }
   }
-  return { added, duplicates, invalid: parsed.invalid, months: [...new Set(parsed.transactions.map((item) => item.date.slice(0, 7)))].sort(), total: parsed.total };
+  return { added, groups: parsed.groups.filter((group) => !existingGroups.some((old) => old.id === group.id)), duplicates, invalid: parsed.invalid, months: [...new Set(parsed.transactions.map((item) => item.date.slice(0, 7)))].sort(), total: parsed.total };
 }
 
-export function createBook(items: Transaction[]) {
-  return { version: 3, exportedAt: new Date().toISOString(), transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
+export function createBook(items: Transaction[], groups: PurposeGroup[] = []) {
+  return { version: 4, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
 }
