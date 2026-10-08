@@ -2,7 +2,7 @@ import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, us
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction,
-  assignGroup, mergeGroups, monthEnd, netExpense, planImport, readBook, transactionSources,
+  assignGroup, groupsInRange, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, transactionSources,
   type ImportPreview, type Kind, type Transaction, type PurposeGroup,
 } from "./billModel";
 
@@ -74,7 +74,7 @@ export default function KoinApp() {
   const [transactions, setTransactions] = useState<Transaction[]>(saved.transactions);
   const [groups, setGroups] = useState<PurposeGroup[]>(saved.groups);
   const [month, setMonth] = useState(() => {
-    const latest = saved.transactions.map((item) => item.date.slice(0, 7)).sort().at(-1);
+    const latest = [...saved.transactions.map((item) => item.date.slice(0, 7)), ...saved.groups.map((group) => group.month)].sort().at(-1);
     return latest ?? monthNow();
   });
   const [view, setView] = useState<View>("overview");
@@ -101,10 +101,12 @@ export default function KoinApp() {
   }
 
   function save(item: Transaction) {
-    setTransactions((currentItems) => editing ? currentItems.map((old) => old.id === item.id ? item : old) : [...currentItems, item]);
+    const savedItem = retainMonthlyGroups(item, groups);
+    const removedGroup = (savedItem.groupIds?.length ?? 0) < (item.groupIds?.length ?? 0);
+    setTransactions((currentItems) => editing ? currentItems.map((old) => old.id === item.id ? savedItem : old) : [...currentItems, savedItem]);
     setEditing(undefined);
     setMonth(item.date.slice(0, 7));
-    setToast(editing ? "记录已更新" : "已补记一笔");
+    setToast(removedGroup ? "记录已更新，已移出原月份分组" : editing ? "记录已更新" : "已补记一笔");
   }
 
   function remove(id: string) {
@@ -154,9 +156,11 @@ export default function KoinApp() {
           setGroups((old) => old.filter((group) => group.id !== id));
           setTransactions((old) => assignGroup(old, old.map((item) => item.id), id, true));
         }} onAssign={(ids, groupId, remove = false) => {
-          if (!groups.some((group) => group.id === groupId)) return;
-          setTransactions((old) => assignGroup(old, ids, groupId, remove));
-          setToast(remove ? "已移出分组" : "已整理到分组");
+          const group = groups.find((group) => group.id === groupId);
+          if (!group) return;
+          const matching = transactions.filter((item) => ids.includes(item.id) && item.date.startsWith(group.month)).length;
+          setTransactions((old) => assignGroup(old, ids, groupId, remove, group.month));
+          setToast(remove ? "已移出分组" : matching < ids.length ? `仅移入 ${group.month} 的 ${matching} 条账单，其他月份保持原分组` : "已整理到分组");
         }} />}
         {view === "data" && <DataView key={month} items={transactions} groups={groups} month={month} onImport={() => setImportOpen(true)} onClear={() => {
           if (!window.confirm("确定清空本机账本吗？建议先导出整本备份，此操作无法撤销。")) return;
@@ -258,12 +262,14 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [groupName, setGroupName] = useState("");
+  const [groupMonth, setGroupMonth] = useState(month);
   const [editingGroup, setEditingGroup] = useState<string | null>(null);
   const [groupError, setGroupError] = useState("");
   const [dragOver, setDragOver] = useState<string | null>(null);
   const [draggedCount, setDraggedCount] = useState(0);
   const pointerDrag = useRef<{ ids: string[]; pointerId: number; x: number; y: number; moved: boolean } | null>(null);
   const validRange = scope !== "range" || Boolean(start && end && start <= end);
+  const visibleGroups = validRange ? groupsInRange(groups, scope === "all" ? undefined : scope === "month" ? month : start, scope === "month" ? month : end) : [];
   const scoped = items.filter((item) => validRange && (scope === "all" || (item.date.slice(0, 7) >= (scope === "month" ? month : start) && item.date.slice(0, 7) <= (scope === "month" ? month : end))));
   const categories = [...new Set(scoped.map((item) => item.category))].sort();
   const merchants = [...new Set(scoped.map((item) => item.merchant))].sort();
@@ -292,9 +298,11 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
     event.preventDefault();
     const name = groupName.trim();
     if (!name) { setGroupError("请输入分组名称"); return; }
-    if (groups.some((group) => group.name === name && group.id !== editingGroup)) { setGroupError("这个分组名称已存在"); return; }
+    const targetMonth = editingGroup ? groups.find((group) => group.id === editingGroup)!.month : scope === "month" ? month : groupMonth;
+    if (!targetMonth || !validRange || (scope === "range" && (targetMonth < start || targetMonth > end))) { setGroupError("请选择查看范围内的月份"); return; }
+    if (groups.some((group) => group.month === targetMonth && group.name === name && group.id !== editingGroup)) { setGroupError("这个月已存在同名分组"); return; }
     const id = editingGroup ?? crypto.randomUUID();
-    onGroupSave({ id, name });
+    onGroupSave({ id, name, month: targetMonth });
     setExpanded((old) => new Set([...old, id]));
     setEditingGroup(null); setGroupName(""); setGroupError("");
   }
@@ -342,17 +350,17 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
       <div className="filters"><input type="search" placeholder="搜索商品、商家、来源或分组" value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div>
       <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span><button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button></div>
     </section>
-    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !groups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{groups.map((group) => <option value={group.id} key={group.id}>{group.name}</option>)}</select><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
+    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
     <section className="purpose-groups" aria-label="用途分组">
-      <div className="group-section-heading"><h2>用途分组</h2><span>拖入单条账单，或勾选后一起拖入</span></div>
-      <form className="group-create" onSubmit={saveGroup}><input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "新建分组"}</button>{editingGroup && <button type="button" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button>}</form>
+      <div className="group-section-heading"><h2>用途分组</h2><span>每月独立，拖入同月账单整理</span></div>
+      <form className="group-create" onSubmit={saveGroup}>{scope !== "month" && !editingGroup && <label>新建月份 <input aria-label="分组所属月份" type="month" min={scope === "range" ? start : undefined} max={scope === "range" ? end : undefined} value={groupMonth} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "新建分组"}</button>{editingGroup && <button type="button" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button>}</form>
       {groupError && <p className="import-error" role="alert">{groupError}</p>}
-      {groups.map((group) => {
+      {visibleGroups.map((group) => {
         const records = visible.filter((item) => item.groupIds?.includes(group.id));
         const total = netExpense(items.filter((item) => item.groupIds?.includes(group.id)));
         return <section key={group.id} data-group-id={group.id} className={`panel purpose-folder${dragOver === group.id ? " drag-over" : ""}`} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDragOver(group.id); } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragOver(null); }} onDrop={(event) => drop(event, group.id)}>
           <div className="folder-heading"><button className="folder-toggle" aria-expanded={expanded.has(group.id)} onClick={() => toggleGroup(group.id)}><span aria-hidden="true">{expanded.has(group.id) ? "▾" : "▸"} ▰</span><strong>{group.name}</strong><span>{records.length} 笔</span><b>¥{yuan(netExpense(records))}</b></button><div className="folder-actions"><button onClick={() => setSelected((old) => new Set([...old, ...records.map((item) => item.id)]))} disabled={!records.length}>勾选组内</button><button onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); }}>改名</button><button onClick={() => onGroupDelete(group.id)}>删除分组</button></div></div>
-          <div className="folder-caption">当前范围净消费 · 全部月份累计 ¥{yuan(total)}</div>
+          <div className="folder-caption">{formatMonth(group.month)} · 本月分组累计 ¥{yuan(total)}</div>
           {expanded.has(group.id) && <div className="folder-records">{records.length ? <BillRows records={records} groupId={group.id} {...rowProps} /> : <p className="small-empty">当前范围没有账单，可以拖入账单到这个分组。</p>}</div>}
         </section>;
       })}
@@ -410,13 +418,14 @@ function DataView({ items, groups, month, onImport, onClear, onExport }: { items
   const [exporting, setExporting] = useState(false);
   const validRange = scope !== "range" || start <= end;
   const selected = scope === "all" ? items : items.filter((item) => item.date.slice(0, 7) >= (scope === "month" ? month : start) && item.date.slice(0, 7) <= (scope === "month" ? month : end));
+  const selectedGroups = validRange ? groupsInRange(groups, scope === "all" ? undefined : scope === "month" ? month : start, scope === "month" ? month : end) : [];
 
   async function exportSelected() {
     const suffix = scope === "all" ? "整本账本" : scope === "month" ? month : `${start}_至_${end}`;
     setExportError("");
     setExporting(true);
     try {
-      if (await downloadBook(selected, `Koin账本_${suffix}.json`, groups)) onExport(selected.length);
+      if (await downloadBook(selected, `Koin账本_${suffix}.json`, selectedGroups)) onExport(selected.length);
     } catch (error) {
       setExportError(`导出失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -424,7 +433,7 @@ function DataView({ items, groups, month, onImport, onClear, onExport }: { items
     }
   }
 
-  return <div className="data-page"><div className="view-heading"><div><span className="eyebrow">本机数据</span><h1>导入与备份</h1><p>由我整理 JSON，你导入查看；修改后再导出最终账本。</p></div></div><div className="data-grid"><section className="panel data-card"><span className="card-icon">↥</span><h2>导入 Koin JSON</h2><p>可一次导入一个或多个自然月。已有 ID 保留本机修改，只补入缺少的记录。</p><button className="primary" onClick={onImport}>选择 JSON 文件</button></section><section className="panel data-card"><span className="card-icon">↓</span><h2>导出整理后的 JSON</h2><p>包括补记和修改；导出的文件可重新导入 Koin。</p><div className="scope-options"><label><input type="radio" checked={scope === "month"} onChange={() => setScope("month")} /> 当前月份</label><label><input type="radio" checked={scope === "range"} onChange={() => setScope("range")} /> 连续多月</label><label><input type="radio" checked={scope === "all"} onChange={() => setScope("all")} /> 整本账本</label></div>{scope === "range" && <div className="month-range"><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></div>}<div className="export-count">将导出 {validRange ? selected.length : 0} 条记录{!validRange ? " · 起始月份不能晚于结束月份" : ""}</div>{exportError && <p className="import-error" role="alert">{exportError}</p>}<button className="primary" disabled={!validRange || (!selected.length && !groups.length) || exporting} onClick={exportSelected}>{exporting ? "正在导出…" : "导出 JSON"}</button></section></div><section className="panel storage-note"><div><h2>本机账本</h2><p>当前保存 {items.length} 条记录。更换电脑或卸载前，请导出整本账本备份。</p></div><button onClick={onClear}>清空本机账本</button></section></div>;
+  return <div className="data-page"><div className="view-heading"><div><span className="eyebrow">本机数据</span><h1>导入与备份</h1><p>由我整理 JSON，你导入查看；修改后再导出最终账本。</p></div></div><div className="data-grid"><section className="panel data-card"><span className="card-icon">↥</span><h2>导入 Koin JSON</h2><p>可一次导入一个或多个自然月。已有 ID 保留本机修改，只补入缺少的记录。</p><button className="primary" onClick={onImport}>选择 JSON 文件</button></section><section className="panel data-card"><span className="card-icon">↓</span><h2>导出整理后的 JSON</h2><p>包括补记和修改；导出的文件可重新导入 Koin。</p><div className="scope-options"><label><input type="radio" checked={scope === "month"} onChange={() => setScope("month")} /> 当前月份</label><label><input type="radio" checked={scope === "range"} onChange={() => setScope("range")} /> 连续多月</label><label><input type="radio" checked={scope === "all"} onChange={() => setScope("all")} /> 整本账本</label></div>{scope === "range" && <div className="month-range"><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></div>}<div className="export-count">将导出 {validRange ? selected.length : 0} 条记录{!validRange ? " · 起始月份不能晚于结束月份" : ""}</div>{exportError && <p className="import-error" role="alert">{exportError}</p>}<button className="primary" disabled={!validRange || (!selected.length && !selectedGroups.length) || exporting} onClick={exportSelected}>{exporting ? "正在导出…" : "导出 JSON"}</button></section></div><section className="panel storage-note"><div><h2>本机账本</h2><p>当前保存 {items.length} 条记录。更换电脑或卸载前，请导出整本账本备份。</p></div><button onClick={onClear}>清空本机账本</button></section></div>;
 }
 
 function ImportDialog({ existing, groups, onClose, onComplete }: { existing: Transaction[]; groups: PurposeGroup[]; onClose: () => void; onComplete: (preview: ImportPreview) => void }) {

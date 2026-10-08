@@ -1,5 +1,5 @@
 export type Kind = "expense" | "refund" | "income" | "repayment" | "transfer";
-export type PurposeGroup = { id: string; name: string };
+export type PurposeGroup = { id: string; name: string; month: string };
 
 export type Transaction = {
   id: string;
@@ -39,6 +39,7 @@ export const CATEGORY_COLORS: Record<string, string> = {
 
 const KINDS: Kind[] = ["expense", "refund", "income", "repayment", "transfer"];
 const DATE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const GENERIC_NOTES = /^(?:消费|支付订单(?:\(.*\))?|付款码支付(?:[—-]+购买商品)?|网上快捷支付|扫码支付|收钱码收款|收款方备注[:：]?二维码收款|先用后付|先骑后付|京东-订单编号|订单编号[:：]?|tradeDesc)$/i;
 
 export function displayTransaction(item: Transaction) {
@@ -102,21 +103,45 @@ export function mergeGroups(existing: PurposeGroup[], incoming: PurposeGroup[]) 
   return [...merged.values()];
 }
 
-export function assignGroup(items: Transaction[], ids: string[], groupId: string, remove = false) {
-  const selected = new Set(ids);
-  return items.map((item) => selected.has(item.id) ? { ...item, groupIds: remove ? (item.groupIds ?? []).filter((id) => id !== groupId) : [groupId] } : item);
+export function groupsInRange(groups: PurposeGroup[], start?: string, end = start) {
+  return groups.filter((group) => !start || (group.month >= start && group.month <= (end ?? start)))
+    .sort((left, right) => right.month.localeCompare(left.month));
 }
 
-export function readBook(value: unknown): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
+export function retainMonthlyGroups(item: Transaction, groups: PurposeGroup[]) {
+  return { ...item, groupIds: (item.groupIds ?? []).filter((id) => groups.some((group) => group.id === id && group.month === item.date.slice(0, 7))) };
+}
+
+export function assignGroup(items: Transaction[], ids: string[], groupId: string, remove = false, month?: string) {
+  const selected = new Set(ids);
+  return items.map((item) => selected.has(item.id) && (remove || !month || item.date.startsWith(month)) ? { ...item, groupIds: remove ? (item.groupIds ?? []).filter((id) => id !== groupId) : [groupId] } : item);
+}
+
+export function readBook(value: unknown, legacyMonth?: string): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
   const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 4)) throw new Error("不支持此 JSON 版本");
+  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 5)) throw new Error("不支持此 JSON 版本");
   const rows = Array.isArray(value) ? value : document?.transactions;
   if (!Array.isArray(rows)) throw new Error("JSON 中没有 transactions 记录列表");
   const rawGroups = document?.groups ?? [];
-  if (!Array.isArray(rawGroups) || rawGroups.some((group) => !group || typeof group.id !== "string" || !group.id.trim() || typeof group.name !== "string" || !group.name.trim())) throw new Error("用途分组格式无效");
-  const groups = mergeGroups([], rawGroups.map((group) => ({ id: group.id.trim(), name: group.name.trim() })));
-  const knownGroups = new Set(groups.map((group) => group.id));
-  const parsed = rows.map(record).map((item) => item?.groupIds?.some((id) => !knownGroups.has(id)) ? null : item);
+  if (!Array.isArray(rawGroups) || rawGroups.some((group) => !group || typeof group.id !== "string" || !group.id.trim() || typeof group.name !== "string" || !group.name.trim() || (group.month !== undefined && (typeof group.month !== "string" || !MONTH.test(group.month))) || (document?.version === 5 && group.month === undefined))) throw new Error("用途分组格式无效");
+  const records = rows.map(record);
+  const fallbackMonth = legacyMonth ?? records.filter((item) => item !== null).map((item) => item.date.slice(0, 7)).sort().at(-1) ?? new Date().toLocaleDateString("sv-SE").slice(0, 7);
+  const legacyIds = new Set(rawGroups.filter((group) => group.month === undefined).map((group) => group.id.trim()));
+  const migrated: PurposeGroup[] = rawGroups.flatMap((group) => {
+    const id = group.id.trim();
+    const name = group.name.trim();
+    if (group.month !== undefined) return [{ id, name, month: group.month }];
+    const months = [...new Set(records.flatMap((item) => item?.groupIds?.includes(id) ? [item.date.slice(0, 7)] : []))];
+    return (months.length ? months : [fallbackMonth]).map((month) => ({ id: `${id}::${month}`, name, month }));
+  });
+  const groups = mergeGroups([], migrated);
+  const knownGroups = new Map(groups.map((group) => [group.id, group]));
+  const parsed = records.map((item): Transaction | null => {
+    if (!item) return null;
+    const month = item.date.slice(0, 7);
+    const groupIds = (item.groupIds ?? []).map((id) => legacyIds.has(id) ? `${id}::${month}` : id);
+    return groupIds.some((id) => knownGroups.get(id)?.month !== month) ? null : { ...item, groupIds };
+  });
   return { transactions: parsed.filter((item): item is Transaction => item !== null), groups, invalid: parsed.filter((item) => item === null).length, total: rows.length };
 }
 
@@ -129,9 +154,9 @@ export function planImport(existing: Transaction[], document: unknown, existingG
     if (known.has(item.id)) duplicates++;
     else { added.push(item); known.add(item.id); }
   }
-  return { added, groups: parsed.groups.filter((group) => !existingGroups.some((old) => old.id === group.id)), duplicates, invalid: parsed.invalid, months: [...new Set(parsed.transactions.map((item) => item.date.slice(0, 7)))].sort(), total: parsed.total };
+  return { added, groups: parsed.groups.filter((group) => !existingGroups.some((old) => old.id === group.id)), duplicates, invalid: parsed.invalid, months: [...new Set([...parsed.transactions.map((item) => item.date.slice(0, 7)), ...parsed.groups.map((group) => group.month)])].sort(), total: parsed.total };
 }
 
 export function createBook(items: Transaction[], groups: PurposeGroup[] = []) {
-  return { version: 4, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
+  return { version: 5, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
 }

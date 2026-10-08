@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assignGroup, counts, createBook, displayTransaction, mergeGroups, monthEnd, netExpense, planImport, readBook, transactionSources } from "../app/billModel.ts";
+import { assignGroup, counts, createBook, displayTransaction, groupsInRange, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, transactionSources } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
 
@@ -79,18 +79,59 @@ test("moves selected purchases and refunds between folders without changing thei
 });
 
 test("folder backups restore memberships, empty folders and duplicate imports preserve local organization", () => {
-  const groups = [{ id: "kitchen", name: "厨具购买" }, { id: "empty", name: "旅行" }];
-  const records = assignGroup([expense("sept", "2026-09-01"), expense("oct", "2026-10-01")], ["sept", "oct"], "kitchen");
-  const monthly = readBook(JSON.parse(JSON.stringify(createBook(records.slice(0, 1), groups))));
-  assert.deepEqual(monthly.groups, groups);
+  const groups = [{ id: "kitchen", name: "厨具购买", month: "2026-09" }, { id: "empty", name: "旅行", month: "2026-09" }, { id: "oct-kitchen", name: "厨具购买", month: "2026-10" }];
+  const records = [expense("sept", "2026-09-01", { groupIds: ["kitchen"] }), expense("oct", "2026-10-01", { groupIds: ["oct-kitchen"] })];
+  const monthly = readBook(JSON.parse(JSON.stringify(createBook(records.slice(0, 1), groupsInRange(groups, "2026-09")))));
+  assert.deepEqual(monthly.groups, groups.slice(0, 2));
   assert.deepEqual(monthly.transactions[0].groupIds, ["kitchen"]);
   const whole = readBook(createBook(records, groups));
-  assert.equal(netExpense(whole.transactions.filter((item) => item.groupIds?.includes("kitchen"))), 56);
-  const localGroups = [{ id: "kitchen", name: "我改过的组名" }];
+  assert.equal(netExpense(whole.transactions), 56);
+  assert.deepEqual(whole.groups, groups);
+  const localGroups = [{ ...groups[0], name: "我改过的组名" }];
   const plan = planImport(assignGroup(records, ["sept"], "empty"), createBook(records, groups), localGroups);
   assert.equal(plan.added.length, 0);
   assert.equal(plan.duplicates, 2);
-  assert.deepEqual(mergeGroups(localGroups, plan.groups), [localGroups[0], groups[1]]);
+  assert.deepEqual(mergeGroups(localGroups, plan.groups), [localGroups[0], ...groups.slice(1)]);
   assert.deepEqual(planImport([], createBook([], groups)).groups, groups);
   assert.equal(readBook({ version: 4, transactions: [{ ...records[0], groupIds: ["missing"] }], groups }).invalid, 1);
+});
+
+test("monthly groups isolate moves, renames, deletion and empty-month exports", () => {
+  const groups = [{ id: "sept", name: "厨具", month: "2026-09" }, { id: "oct", name: "厨具", month: "2026-10" }, { id: "empty", name: "旅行", month: "2026-11" }];
+  const rows = [expense("pan", "2026-09-01"), expense("refund", "2026-09-02", { kind: "refund", amount: 8 }), expense("oct-pan", "2026-10-01", { groupIds: ["oct"] })];
+  const moved = assignGroup(rows, rows.map((item) => item.id), "sept", false, "2026-09");
+  assert.deepEqual(moved[2].groupIds, ["oct"]);
+  assert.equal(netExpense(moved.filter((item) => item.groupIds?.includes("sept"))), 20);
+  assert.deepEqual(groupsInRange(groups, "2026-09").map((group) => group.id), ["sept"]);
+  assert.deepEqual(groupsInRange(groups, "2026-09", "2026-10").map((group) => group.id), ["oct", "sept"]);
+  const renamed = groups.map((group) => group.id === "sept" ? { ...group, name: "锅具" } : group);
+  assert.equal(renamed[1].name, "厨具");
+  const deleted = assignGroup(moved, moved.map((item) => item.id), "sept", true);
+  assert.deepEqual(deleted[2].groupIds, ["oct"]);
+  assert.equal(netExpense(deleted), netExpense(rows));
+  const emptyBackup = createBook([], groupsInRange(groups, "2026-11"));
+  assert.deepEqual(readBook(emptyBackup).groups, [groups[2]]);
+  assert.deepEqual(planImport([], emptyBackup).months, ["2026-11"]);
+  assert.equal(retainMonthlyGroups({ ...moved[0], date: "2026-10-01" }, groups).groupIds.length, 0);
+  assert.deepEqual(retainMonthlyGroups(moved[0], groups).groupIds, ["sept"]);
+});
+
+test("legacy global groups split deterministically by month without changing transactions or totals", () => {
+  const old = { version: 4, groups: [{ id: "kitchen", name: "厨具" }, { id: "empty", name: "旅行" }], transactions: [expense("pan", "2026-09-01", { groupIds: ["kitchen"] }), expense("refund", "2026-10-01", { groupIds: ["kitchen"], kind: "refund", amount: 8 }), expense("excluded", "2026-09-02", { groupIds: ["kitchen"], counted: false })] };
+  const migrated = readBook(old);
+  assert.equal(migrated.invalid, 0);
+  assert.equal(migrated.groups.length, 3);
+  assert.equal(migrated.transactions.length, 3);
+  assert.equal(netExpense(migrated.transactions), netExpense(old.transactions));
+  assert.equal(migrated.transactions[2].counted, false);
+  for (const item of migrated.transactions) assert.equal(migrated.groups.find((group) => group.id === item.groupIds[0]).month, item.date.slice(0, 7));
+  const reimport = planImport(migrated.transactions, old, migrated.groups);
+  assert.equal(reimport.added.length, 0);
+  assert.equal(reimport.groups.length, 0);
+  assert.deepEqual(readBook(createBook(migrated.transactions, migrated.groups)).groups, migrated.groups);
+  const single = readBook({ ...old, transactions: old.transactions.slice(0, 1) });
+  assert.equal(single.groups[0].id, migrated.groups[0].id);
+  assert.equal(readBook({ version: 4, groups: old.groups, transactions: [] }, "2026-09").groups[0].month, "2026-09");
+  assert.throws(() => readBook({ version: 5, groups: old.groups, transactions: [] }), /格式无效/);
+  assert.equal(readBook({ version: 5, groups: [{ id: "sept", name: "厨具", month: "2026-09" }], transactions: [expense("bad", "2026-10-01", { groupIds: ["sept"] })] }).invalid, 1);
 });
