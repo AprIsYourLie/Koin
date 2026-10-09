@@ -739,19 +739,20 @@ function DataView({ items, groups, month, onImport, onClear, onExport }: { items
 
 function ImportDialog({ existing, groups, onClose, onComplete }: { existing: Transaction[]; groups: PurposeGroup[]; onClose: () => void; onComplete: (preview: ImportPreview) => void }) {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
-  const [fileNames, setFileNames] = useState("");
+  const [files, setFiles] = useState<{ name: string; size: number }[]>([]);
+  const [reading, setReading] = useState(false);
   const [error, setError] = useState("");
 
   async function readFiles(event: ChangeEvent<HTMLInputElement>) {
-    const files = [...(event.target.files ?? [])];
+    const chosen = [...(event.target.files ?? [])];
     event.target.value = "";
-    if (!files.length) return;
-    setError(""); setPreview(null); setFileNames(files.map((file) => file.name).join("、"));
+    if (!chosen.length) return;
+    setError(""); setPreview(null); setFiles(chosen.map((file) => ({ name: file.name, size: file.size }))); setReading(true);
     try {
       const records: Transaction[] = [];
       let importedGroups: PurposeGroup[] = [];
       let invalid = 0; let total = 0;
-      for (const file of files) {
+      for (const file of chosen) {
         if (!file.name.toLowerCase().endsWith(".json")) throw new Error(`${file.name} 不是 JSON 文件`);
         const parsed = readBook(JSON.parse(await file.text()));
         records.push(...parsed.transactions);
@@ -762,10 +763,27 @@ function ImportDialog({ existing, groups, onClose, onComplete }: { existing: Tra
       setPreview({ ...plan, invalid: plan.invalid + invalid, total });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "文件读取失败，请检查 JSON 格式");
-    }
+    } finally { setReading(false); }
   }
 
-  return <Modal title="导入 Koin JSON" onClose={onClose}><div className="import-dialog"><p>选择我整理好的 JSON，或之前从 Koin 导出的完整备份。可以同时选择多个文件。</p><label className="file-picker">选择 JSON 文件<input type="file" accept=".json,application/json" multiple onChange={readFiles} /></label>{fileNames && <small className="file-name">{fileNames}</small>}{error && <p className="import-error" role="alert">{error}</p>}{preview && <><div className="import-preview"><div><span>月份范围</span><strong>{preview.months.length ? `${formatMonth(preview.months[0])} — ${formatMonth(preview.months.at(-1)!)}` : "无有效记录"}</strong></div><div><span>新增</span><strong>{preview.added.length} 条</strong></div><div><span>重复 ID</span><strong>{preview.duplicates} 条</strong></div><div><span>无效记录</span><strong>{preview.invalid} 条</strong></div></div><p className="import-hint">重复 ID 保留 Koin 中的版本；无效记录不会导入。共读取 {preview.total} 条，新增 {preview.groups.length} 个用途分组。</p></>}<div className="modal-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={!preview || (!preview.added.length && !preview.groups.length)} onClick={() => preview && onComplete(preview)}>确认导入</button></div></div></Modal>;
+  const period = preview?.months.length ? preview.months.length === 1 ? formatMonth(preview.months[0]) : `${formatMonth(preview.months[0])} — ${formatMonth(preview.months.at(-1)!)}` : "无有效记录";
+  const ready = Boolean(preview && (preview.added.length || preview.groups.length));
+  return <Modal title="导入账单" className="import-modal" onClose={onClose}><div className="import-dialog">
+    <div className="import-body">
+      {files.length === 0 && <div className="import-intro"><p>选择整理好的 Koin JSON 或账本备份。</p><span>可一次选择多个文件，确认前会先预览。</span></div>}
+      <label className={`file-picker${files.length ? " has-files" : ""}${reading ? " is-reading" : ""}`}>
+        <input type="file" aria-label="选择 JSON 文件" accept=".json,application/json" multiple disabled={reading} onChange={readFiles} />
+        <span className="upload-symbol" aria-hidden="true"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4" /></svg></span>
+        <strong>{reading ? "正在读取账单…" : files.length ? "重新选择文件" : "选择 JSON 文件"}</strong>
+        <span>点击此区域选择文件 · 支持 .json 格式</span>
+      </label>
+      {reading && <p className="import-reading" role="status">正在检查记录和重复 ID，请稍候…</p>}
+      {files.length > 0 && <section className="import-files" aria-label="已选文件"><div className="import-section-heading"><h3>已选文件</h3><span>{files.length} 个</span></div><ul>{files.map((file, index) => <li key={`${file.name}-${index}`}><span className="file-type" aria-hidden="true">JSON</span><div><strong>{file.name}</strong><small>{file.size < 1024 * 1024 ? `${Math.max(1, Math.ceil(file.size / 1024))} KB` : `${(file.size / 1024 / 1024).toFixed(1)} MB`}</small></div></li>)}</ul></section>}
+      {error && <p className="import-error" role="alert">{error}</p>}
+      {preview && <section className="import-results" aria-label="导入预览"><div className="import-section-heading"><h3>导入预览</h3><span>共读取 {preview.total} 条</span></div><div className="import-period"><span>账单月份</span><strong>{period}</strong></div><div className="import-preview"><div className="new-records"><span>新增</span><strong>{preview.added.length}<small> 条</small></strong></div><div><span>重复</span><strong>{preview.duplicates}<small> 条</small></strong></div><div className={preview.invalid ? "invalid-records" : ""}><span>无效</span><strong>{preview.invalid}<small> 条</small></strong></div></div><p className="import-hint">重复记录保留账本里的修改；无效记录会跳过。{preview.groups.length > 0 && `同时新增 ${preview.groups.length} 个用途分组。`}</p>{!ready && <p className="import-no-new" role="status">{preview.duplicates > 0 && !preview.invalid ? "这些记录已在账本中，无需重复导入。" : "文件中没有可导入的新记录。"}</p>}</section>}
+    </div>
+    <div className="modal-actions import-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={reading || !ready} onClick={() => preview && onComplete(preview)}>确认导入{preview && ready && <span>{preview.added.length} 条</span>}</button></div>
+  </div></Modal>;
 }
 
 function Editor({ initial, month, onClose, onSave, onDelete }: { initial: Transaction | null; month: string; onClose: () => void; onSave: (item: Transaction) => void; onDelete?: () => void }) {
@@ -779,6 +797,6 @@ function Editor({ initial, month, onClose, onSave, onDelete }: { initial: Transa
   return <Modal title={initial ? "编辑记录" : "补记一笔"} onClose={onClose}><form className="editor-form" onSubmit={submit}><div className="form-grid"><label>日期<input type="date" required value={form.date} onChange={(event) => change("date", event.target.value)} /></label><label>金额（元）<input type="number" required min="0.01" step="0.01" value={form.amount || ""} onChange={(event) => change("amount", Number(event.target.value))} /></label><label>类型<select value={form.kind} onChange={(event) => { const kind = event.target.value as Kind; setForm((current) => ({ ...current, kind, counted: kind === "repayment" || kind === "transfer" ? false : current.kind === "repayment" || current.kind === "transfer" ? true : current.counted })); }}>{(Object.keys(KIND_NAMES) as Kind[]).map((kind) => <option value={kind} key={kind}>{KIND_NAMES[kind]}</option>)}</select></label><label>分类<select value={form.category} onChange={(event) => change("category", event.target.value)}>{[...new Set([...CATEGORIES, form.category])].map((name) => <option key={name}>{name}</option>)}</select></label></div><label>商家<input required value={form.merchant} onChange={(event) => change("merchant", event.target.value)} placeholder="例如：美团" /></label><label>商品或用途<input value={form.note ?? ""} onChange={(event) => change("note", event.target.value)} placeholder="例如：晚餐" /></label><label>标签<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="例如：外卖、聚餐" /></label><label className="counted-toggle"><input type="checkbox" checked={counts(form)} onChange={(event) => change("counted", event.target.checked)} />计入统计</label><div className="modal-actions">{onDelete && <button type="button" className="danger-button" onClick={onDelete}>删除</button>}<button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">保存</button></div></form></Modal>;
 }
 
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-label={title}><header><h2>{title}</h2><button onClick={onClose} aria-label="关闭">×</button></header>{children}</section></div>;
+function Modal({ title, className = "", onClose, children }: { title: string; className?: string; onClose: () => void; children: React.ReactNode }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${className}`} role="dialog" aria-modal="true" aria-label={title}><header><h2>{title}</h2><button onClick={onClose} aria-label="关闭">×</button></header>{children}</section></div>;
 }

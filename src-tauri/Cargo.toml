@@ -1,6 +1,6 @@
 [package]
 name = "koin"
-version = "0.4.7"
+version = "0.4.8"
 description = "个人账单可视化工具"
 authors = ["AprIsYourLie"]
 edition = "2021"
