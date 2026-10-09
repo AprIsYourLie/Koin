@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assignGroup, counts, createBook, deleteTransaction, detachTransactions, displayTransaction, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, monthlyPaymentSummary, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
+import { applyMonthlyAccounting, assignGroup, contextTransactionIds, counts, createBook, deleteTransaction, detachTransactions, displayTransaction, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, monthlyPaymentSummary, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
 
@@ -299,8 +299,63 @@ test("monthly payment summary includes refund followups once and validates payme
   const regrouped = linkTransactions(linked, ["refund"], "payment", "monthly");
   assert.equal(monthlyPaymentSummary(relationIndex(regrouped), "payment").total, 80);
   assert.equal(monthlyPaymentSummary(relationIndex(regrouped), "payment").records.length, 2);
-  assert.throws(() => linkTransactions(original, ["payment"], "buy", "monthly"), /消费或退款/);
+  assert.equal(linkTransactions(original, ["payment"], "buy", "monthly")[0].counted, false);
   assert.throws(() => linkTransactions(original, ["buy"], "refund", "monthly"), /主账单/);
   assert.throws(() => linkTransactions(regrouped, ["buy"], "refund", "monthly"), /主账单/);
-  assert.throws(() => linkTransactions(regrouped, ["payment"], "buy", "monthly"), /主账单/);
+  assert.throws(() => linkTransactions(regrouped, ["payment"], "buy", "monthly"), /循环/);
+});
+
+
+test("context actions use the entire selection on a selected row and the clicked row otherwise", () => {
+  const items = [expense("a", "2026-07-15"), expense("b", "2026-08-08"), expense("c", "2026-08-09")];
+  const selected = new Set(["a", "b", "deleted"]);
+  assert.deepEqual(contextTransactionIds(items, selected, "a"), ["a", "b"]);
+  assert.deepEqual(contextTransactionIds(items, selected, "b"), ["a", "b"]);
+  assert.deepEqual(contextTransactionIds(items, selected, "c"), ["c"]);
+  assert.equal(netExpense(setCounted(items, contextTransactionIds(items, selected, "a"), false)), 28);
+  assert.deepEqual(selected, new Set(["a", "b", "deleted"]));
+});
+
+test("early July repayment joins an August bill without moving dates or duplicating consumption", () => {
+  const rows = [expense("aug", "2026-08-08", { kind: "repayment", amount: 80 }), expense("early", "2026-07-15", { kind: "repayment", amount: 20 }), expense("buy", "2026-07-03", { amount: 100, counted: false })];
+  const linked = linkTransactions(rows, ["early", "buy"], "aug", "monthly");
+  assert.equal(linked[1].parentId, "aug");
+  assert.equal(linked[1].date, "2026-07-15");
+  assert.equal(linked[1].counted, false);
+  assert.equal(netExpense(linked), 100);
+  const summary = monthlyPaymentSummary(relationIndex(linked), "aug");
+  assert.equal(summary.earlyRepayments, 20);
+  assert.equal(summary.paid, 100);
+  assert.equal(summary.total, 100);
+  assert.equal(summary.difference, 0);
+  assert.equal(summary.details.length, 1);
+  const cash = applyMonthlyAccounting(linked, "repayments");
+  assert.equal(netExpense(cash), 100);
+  assert.equal(cash[2].counted, false);
+  assert.equal(netExpense(cash.filter((item) => item.date.startsWith("2026-07"))), 20);
+  assert.equal(netExpense(cash.filter((item) => item.date.startsWith("2026-08"))), 80);
+  assert.equal(monthlyPaymentSummary(relationIndex(cash), "aug").difference, 0);
+  assert.equal(netExpense(applyMonthlyAccounting(cash, "details")), 100);
+});
+
+test("monthly accounting switches nested prepayments and refund followups while preserving unrelated edits", () => {
+  const rows = [expense("aug", "2026-08-08", { kind: "repayment", amount: 60 }), expense("early", "2026-07-15", { kind: "repayment", amount: 20 }), expense("buy", "2026-07-03", { amount: 100 }), expense("refund", "2026-07-04", { kind: "refund", amount: 20 }), expense("outside", "2026-07-05", { counted: false })];
+  const withRefund = linkTransactions(rows, ["refund"], "buy", "followup");
+  const early = linkTransactions(withRefund, ["buy"], "early", "monthly");
+  const linked = linkTransactions(early, ["early"], "aug", "monthly", "repayments");
+  assert.deepEqual(linked.map((row) => row.counted), [true, true, false, false, false]);
+  assert.equal(netExpense(linked), 80);
+  assert.equal(monthlyPaymentSummary(relationIndex(linked), "aug").total, 80);
+  assert.equal(monthlyPaymentSummary(relationIndex(linked), "aug").difference, 0);
+  assert.deepEqual(applyMonthlyAccounting(linked, "details").map((row) => row.counted), [false, false, true, true, false]);
+  const restored = readBook(JSON.parse(JSON.stringify(createBook(linked)))).transactions;
+  assert.equal(netExpense(restored), 80);
+  for (const dates of [["2026-07", "2026-08"], ["2026-08", "2026-07"]]) {
+    let recovered = [];
+    for (const month of dates) recovered.push(...planImport(recovered, createBook(linked.filter((row) => row.date.startsWith(month)))).added);
+    assert.equal(netExpense(recovered), 80);
+    assert.equal(monthlyPaymentSummary(relationIndex(recovered), "aug").difference, 0);
+  }
+  assert.throws(() => linkTransactions(linked, ["aug"], "buy", "monthly"), /循环/);
+  assert.throws(() => linkTransactions([...rows, expense("income", "2026-07-02", { kind: "income" })], ["income"], "aug", "monthly"), /收入/);
 });

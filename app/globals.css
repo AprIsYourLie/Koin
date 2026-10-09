@@ -329,3 +329,15 @@ main { min-width:0; }
 .monthly-payment-summary { display:flex; flex-wrap:wrap; gap:8px 16px; margin:8px 0; padding:12px 14px; border-radius:10px; background:#edf4f0; font-size:0.8125rem; }
 .monthly-payment-summary strong { color:var(--ink); }
 .monthly-payment-summary small { flex-basis:100%; color:var(--muted); }
+
+.sidebar-settings { width:100%; margin-top:16px; padding:10px; border:1px solid var(--line); border-radius:10px; background:transparent; color:var(--muted); cursor:pointer; text-align:left; }
+.editor-form .relation-choices .choice-card { display:grid; grid-template-columns:18px minmax(0,1fr); align-items:center; gap:14px; padding:16px; border:1px solid var(--line); border-radius:12px; text-align:left; transition:background .15s,border-color .15s; }
+.editor-form .relation-choices .choice-card:has(input:checked) { border-color:#99b3a1; background:#edf5ef; box-shadow:inset 3px 0 #7e9b86; }
+.editor-form .relation-choices input[type="radio"] { width:18px; height:18px; min-height:18px; padding:0; margin:0; border-radius:50%; accent-color:var(--accent); }
+.editor-form .relation-choices span { min-width:0; display:flex; flex-direction:column; gap:6px; }
+.editor-form .relation-choices strong { font-size:0.875rem; }
+.editor-form .relation-choices small { font-size:0.75rem; line-height:1.6; font-weight:400; }
+.settings-form h3 { margin:0; font-size:0.9375rem; }
+.settings-form>p { margin:0; font-size:0.8125rem; color:var(--muted); line-height:1.7; }
+
+@media(max-width:650px) { .top-actions .settings-button { display:inline-flex; min-height:36px; padding:0 10px; font-size:0.6875rem; } }

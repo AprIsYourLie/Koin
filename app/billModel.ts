@@ -1,4 +1,5 @@
 export type Kind = "expense" | "refund" | "income" | "repayment" | "transfer";
+export type MonthlyAccounting = "details" | "repayments";
 export type RelationKind = "followup" | "attachment" | "monthly";
 export type PurposeGroup = { id: string; name: string; month: string };
 
@@ -115,8 +116,31 @@ export function monthlyPaymentSummary(index: ReturnType<typeof relationIndex>, i
     for (const row of relatedTransactions(index, child.id)) entries.set(row.id, row);
   }
   const records = [...entries.values()];
-  const total = netExpense(records);
-  return { records, total, difference: (bill?.amount ?? 0) - total };
+  const paymentIds = new Set(records.filter((row) => row.kind === "repayment" || row.kind === "transfer" || index.children.get(row.id)?.some((child) => child.relation === "monthly")).map((row) => row.id));
+  const details = records.filter((row) => !paymentIds.has(row.id));
+  const total = netExpense(details.map((row) => ({ ...row, counted: true })));
+  const earlyRepayments = records.filter((row) => paymentIds.has(row.id)).reduce((sum, row) => sum + row.amount, 0);
+  const paid = (bill?.amount ?? 0) + earlyRepayments;
+  return { records, details, total, earlyRepayments, paid, difference: paid - total };
+}
+
+export function applyMonthlyAccounting(items: Transaction[], mode: MonthlyAccounting, rootIds?: string[]) {
+  const index = relationIndex(items);
+  const roots = [...index.children].filter(([, children]) => children.some((child) => child.relation === "monthly")).map(([id]) => id);
+  const billIds = new Set(roots);
+  const included = new Map<string, boolean>();
+  for (const id of rootIds ?? roots) {
+    included.set(id, mode === "repayments");
+    for (const row of monthlyPaymentSummary(index, id).records) {
+      const payment = billIds.has(row.id) || row.kind === "repayment" || row.kind === "transfer";
+      included.set(row.id, mode === "repayments" ? payment : !payment && row.kind !== "income");
+    }
+  }
+  return items.map((item) => included.has(item.id) ? { ...item, counted: included.get(item.id)! } : item);
+}
+
+export function contextTransactionIds(items: Transaction[], selected: Set<string>, clickedId: string) {
+  return items.filter((item) => selected.has(clickedId) ? selected.has(item.id) : item.id === clickedId).map((item) => item.id);
 }
 
 function validateRelations(items: Transaction[]) {
@@ -134,7 +158,7 @@ function validateRelations(items: Transaction[]) {
   }
 }
 
-export function linkTransactions(items: Transaction[], ids: string[], parentId: string, relation: RelationKind) {
+export function linkTransactions(items: Transaction[], ids: string[], parentId: string, relation: RelationKind, monthlyMode: MonthlyAccounting = "details") {
   if (!items.some((item) => item.id === parentId)) throw new Error("主账单不存在");
   if (relation !== "followup" && relation !== "attachment" && relation !== "monthly") throw new Error("关联类型无效");
   const selected = new Set(ids);
@@ -142,13 +166,16 @@ export function linkTransactions(items: Transaction[], ids: string[], parentId: 
   if (selected.has(parentId)) throw new Error("主账单不能同时被选为它的关联记录");
   if (relation === "monthly") {
     const parent = items.find((item) => item.id === parentId)!;
-    if (parent.kind === "income" || parent.kind === "refund" || parent.relation === "monthly") throw new Error("请选择月付还款账单作为主账单");
-    if (items.some((item) => selected.has(item.id) && item.kind !== "expense" && item.kind !== "refund")) throw new Error("月付明细只能包含消费或退款，请选择对应记录");
-    if (items.some((item) => selected.has(item.id) && items.some((child) => child.parentId === item.id && child.relation === "monthly"))) throw new Error("月付账单不能作为另一张月付账单的消费明细");
+    if (parent.kind === "income" || parent.kind === "refund") throw new Error("请选择月付还款账单作为主账单");
+    if (items.some((item) => selected.has(item.id) && item.kind === "income")) throw new Error("月付关联可包含消费、退款或提前还款，不能包含收入");
   }
-  const result = items.map((item) => selected.has(item.id) ? { ...item, parentId, relation, ...(relation === "monthly" ? { counted: true } : {}) } : relation === "monthly" && item.id === parentId ? { ...item, counted: false } : item);
+  const result = items.map((item) => selected.has(item.id) ? { ...item, parentId, relation } : item);
   validateRelations(result);
-  return result;
+  if (relation !== "monthly") return result;
+  const index = relationIndex(result);
+  let root = index.byId.get(parentId)!;
+  while (root.relation === "monthly" && root.parentId && index.byId.has(root.parentId)) root = index.byId.get(root.parentId)!;
+  return applyMonthlyAccounting(result, monthlyMode, [root.id]);
 }
 
 export function detachTransactions(items: Transaction[], ids: string[]) {
