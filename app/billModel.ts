@@ -1,4 +1,5 @@
 export type Kind = "expense" | "refund" | "income" | "repayment" | "transfer";
+export type RelationKind = "followup" | "attachment";
 export type PurposeGroup = { id: string; name: string; month: string };
 
 export type Transaction = {
@@ -19,6 +20,8 @@ export type Transaction = {
   possibleMatchId?: string;
   orderId?: string;
   evidence?: unknown[];
+  parentId?: string;
+  relation?: RelationKind;
 };
 
 export type ImportPreview = {
@@ -57,12 +60,12 @@ export function transactionSources(item: Transaction) {
 }
 
 export function counts(item: Transaction) {
-  return item.counted !== false && item.kind !== "repayment" && item.kind !== "transfer";
+  return item.counted ?? (item.kind !== "repayment" && item.kind !== "transfer");
 }
 
 export function setCounted(items: Transaction[], ids: string[], counted: boolean) {
   const selected = new Set(ids);
-  return items.map((item) => selected.has(item.id) && (!counted || (item.kind !== "repayment" && item.kind !== "transfer")) ? { ...item, counted } : item);
+  return items.map((item) => selected.has(item.id) ? { ...item, counted } : item);
 }
 
 export function groupTransactionsByDay(items: Transaction[]) {
@@ -76,7 +79,68 @@ export function groupTransactionsByDay(items: Transaction[]) {
 }
 
 export function netExpense(items: Transaction[]) {
-  return items.reduce((sum, item) => sum + (counts(item) ? item.kind === "expense" ? item.amount : item.kind === "refund" ? -item.amount : 0 : 0), 0);
+  return items.reduce((sum, item) => sum + (counts(item) ? item.kind === "refund" ? -item.amount : item.kind === "income" ? 0 : item.amount : 0), 0);
+}
+
+export function relationIndex(items: Transaction[]) {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const children = new Map<string, Transaction[]>();
+  for (const item of items) if (item.parentId && byId.has(item.parentId)) {
+    if (!children.has(item.parentId)) children.set(item.parentId, []);
+    children.get(item.parentId)!.push(item);
+  }
+  for (const rows of children.values()) rows.sort((a, b) => a.date.localeCompare(b.date) || Number(!counts(a)) - Number(!counts(b)) || a.id.localeCompare(b.id));
+  return { byId, children };
+}
+
+export function relatedTransactions(index: ReturnType<typeof relationIndex>, id: string) {
+  const found: Transaction[] = [];
+  const pending = [id];
+  const seen = new Set<string>();
+  while (pending.length) {
+    const next = pending.pop()!;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    const item = index.byId.get(next);
+    if (item) found.push(item);
+    pending.push(...(index.children.get(next) ?? []).map((child) => child.id));
+  }
+  return found;
+}
+
+function validateRelations(items: Transaction[]) {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const complete = new Set<string>();
+  for (const item of items) {
+    const path = new Set<string>();
+    let current: Transaction | undefined = item;
+    while (current && !complete.has(current.id)) {
+      if (path.has(current.id)) throw new Error("关联不能形成循环，也不能关联到自己");
+      path.add(current.id);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+    for (const id of path) complete.add(id);
+  }
+}
+
+export function linkTransactions(items: Transaction[], ids: string[], parentId: string, relation: RelationKind) {
+  if (!items.some((item) => item.id === parentId)) throw new Error("主账单不存在");
+  if (relation !== "followup" && relation !== "attachment") throw new Error("关联类型无效");
+  const selected = new Set(ids);
+  if (!selected.size || ids.some((id) => !items.some((item) => item.id === id))) throw new Error("请选择有效的关联账单");
+  if (selected.has(parentId)) throw new Error("主账单不能同时被选为它的关联记录");
+  const result = items.map((item) => selected.has(item.id) ? { ...item, parentId, relation } : item);
+  validateRelations(result);
+  return result;
+}
+
+export function detachTransactions(items: Transaction[], ids: string[]) {
+  const selected = new Set(ids);
+  return items.map((item) => selected.has(item.id) ? { ...item, parentId: undefined, relation: undefined } : item);
+}
+
+export function deleteTransaction(items: Transaction[], id: string) {
+  return detachTransactions(items.filter((item) => item.id !== id), items.filter((item) => item.parentId === id).map((item) => item.id));
 }
 
 export function monthEnd(month: string) {
@@ -99,6 +163,8 @@ function record(value: unknown): Transaction | null {
   if (item.counted !== undefined && typeof item.counted !== "boolean") return null;
   if (item.tags !== undefined && (!Array.isArray(item.tags) || item.tags.some((tag) => typeof tag !== "string"))) return null;
   if (item.groupIds !== undefined && (!Array.isArray(item.groupIds) || item.groupIds.some((id) => typeof id !== "string" || !id.trim()))) return null;
+  if (item.parentId !== undefined && (typeof item.parentId !== "string" || !item.parentId.trim() || !["followup", "attachment"].includes(item.relation as string))) return null;
+  if (item.parentId === undefined && item.relation !== undefined) return null;
   return {
     ...item,
     id: item.id.trim(),
@@ -109,6 +175,7 @@ function record(value: unknown): Transaction | null {
     source: typeof item.source === "string" ? item.source : "整理导入",
     payment: typeof item.payment === "string" ? item.payment : "",
     note: typeof item.note === "string" ? item.note : undefined,
+    parentId: typeof item.parentId === "string" ? item.parentId.trim() : undefined,
   } as Transaction;
 }
 
@@ -134,11 +201,11 @@ export function assignGroup(items: Transaction[], ids: string[], groupId: string
 
 export function readBook(value: unknown, legacyMonth?: string): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
   const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 5)) throw new Error("不支持此 JSON 版本");
+  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 6)) throw new Error("不支持此 JSON 版本");
   const rows = Array.isArray(value) ? value : document?.transactions;
   if (!Array.isArray(rows)) throw new Error("JSON 中没有 transactions 记录列表");
   const rawGroups = document?.groups ?? [];
-  if (!Array.isArray(rawGroups) || rawGroups.some((group) => !group || typeof group.id !== "string" || !group.id.trim() || typeof group.name !== "string" || !group.name.trim() || (group.month !== undefined && (typeof group.month !== "string" || !MONTH.test(group.month))) || (document?.version === 5 && group.month === undefined))) throw new Error("用途分组格式无效");
+  if (!Array.isArray(rawGroups) || rawGroups.some((group) => !group || typeof group.id !== "string" || !group.id.trim() || typeof group.name !== "string" || !group.name.trim() || (group.month !== undefined && (typeof group.month !== "string" || !MONTH.test(group.month))) || (typeof document?.version === "number" && document.version >= 5 && group.month === undefined))) throw new Error("用途分组格式无效");
   const records = rows.map(record);
   const fallbackMonth = legacyMonth ?? records.filter((item) => item !== null).map((item) => item.date.slice(0, 7)).sort().at(-1) ?? new Date().toLocaleDateString("sv-SE").slice(0, 7);
   const legacyIds = new Set(rawGroups.filter((group) => group.month === undefined).map((group) => group.id.trim()));
@@ -157,7 +224,9 @@ export function readBook(value: unknown, legacyMonth?: string): { transactions: 
     const groupIds = (item.groupIds ?? []).map((id) => legacyIds.has(id) ? `${id}::${month}` : id);
     return groupIds.some((id) => knownGroups.get(id)?.month !== month) ? null : { ...item, groupIds };
   });
-  return { transactions: parsed.filter((item): item is Transaction => item !== null), groups, invalid: parsed.filter((item) => item === null).length, total: rows.length };
+  const transactions = parsed.filter((item): item is Transaction => item !== null);
+  validateRelations(transactions);
+  return { transactions, groups, invalid: parsed.filter((item) => item === null).length, total: rows.length };
 }
 
 export function planImport(existing: Transaction[], document: unknown, existingGroups: PurposeGroup[] = []): ImportPreview {
@@ -169,9 +238,10 @@ export function planImport(existing: Transaction[], document: unknown, existingG
     if (known.has(item.id)) duplicates++;
     else { added.push(item); known.add(item.id); }
   }
+  validateRelations([...existing, ...added]);
   return { added, groups: parsed.groups.filter((group) => !existingGroups.some((old) => old.id === group.id)), duplicates, invalid: parsed.invalid, months: [...new Set([...parsed.transactions.map((item) => item.date.slice(0, 7)), ...parsed.groups.map((group) => group.month)])].sort(), total: parsed.total };
 }
 
 export function createBook(items: Transaction[], groups: PurposeGroup[] = []) {
-  return { version: 5, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
+  return { version: 6, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
 }

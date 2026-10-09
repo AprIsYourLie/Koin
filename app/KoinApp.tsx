@@ -2,14 +2,15 @@ import { ChangeEvent, DragEvent, FormEvent, MouseEvent, PointerEvent, useEffect,
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction,
-  assignGroup, groupsInRange, groupTransactionsByDay, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, setCounted, transactionSources,
-  type ImportPreview, type Kind, type Transaction, type PurposeGroup,
+  assignGroup, deleteTransaction, detachTransactions, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources,
+  type ImportPreview, type Kind, type Transaction, type PurposeGroup, type RelationKind,
 } from "./billModel";
 
 type View = "overview" | "details" | "data";
 type DetailFilter = { category?: string; merchant?: string; tag?: string };
 
 const KIND_NAMES: Record<Kind, string> = { expense: "支出", refund: "退款", income: "收入", repayment: "还款", transfer: "转账" };
+const RELATION_NAMES: Record<RelationKind, string> = { followup: "后续", attachment: "附属" };
 const FONT_SIZES = [100, 115, 130, 150];
 const FONT_KEY = "koin.fontScale.v1";
 
@@ -133,8 +134,8 @@ export default function KoinApp() {
   }
 
   function remove(id: string) {
-    if (!window.confirm("确定删除这条记录吗？")) return;
-    setTransactions((currentItems) => currentItems.filter((item) => item.id !== id));
+    if (!window.confirm("确定删除这条记录吗？它的关联记录会保留并解除与它的关联。")) return;
+    setTransactions((currentItems) => deleteTransaction(currentItems, id));
     setEditing(undefined);
     setToast("记录已删除");
   }
@@ -177,6 +178,12 @@ export default function KoinApp() {
         {view === "details" && <Details items={transactions} groups={groups} month={month} onMonthVisible={setMonth} initialFilter={detailFilter} onEdit={setEditing} onAdd={() => setEditing(null)} onCounted={(ids, counted) => {
           setTransactions((old) => setCounted(old, ids, counted));
           setToast(counted ? "已恢复计入统计" : "已设为不计入统计");
+        }} onLink={(ids, parentId, relation) => {
+          setTransactions(linkTransactions(transactions, ids, parentId, relation));
+          setToast(`已关联 ${ids.length} 条${RELATION_NAMES[relation]}记录`);
+        }} onDetach={(ids) => {
+          setTransactions((old) => detachTransactions(old, ids));
+          setToast("已解除关联，账单内容保持不变");
         }} onGroupSave={(group) => setGroups((old) => old.some((item) => item.id === group.id) ? old.map((item) => item.id === group.id ? group : item) : [...old, group])} onGroupDelete={(id) => {
           if (!window.confirm("删除这个分组？组内账单会回到未分组列表。")) return;
           setGroups((old) => old.filter((group) => group.id !== id));
@@ -212,7 +219,7 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: string; 
 }
 
 function Overview({ current, all, month, onImport, onDetails }: { current: Transaction[]; all: Transaction[]; month: string; onImport: () => void; onDetails: (filter?: DetailFilter) => void }) {
-  const expenses = current.filter((item) => counts(item) && item.kind === "expense");
+  const expenses = current.filter((item) => counts(item) && item.kind !== "refund" && item.kind !== "income");
   const refunds = current.filter((item) => counts(item) && item.kind === "refund");
   const income = current.filter((item) => counts(item) && item.kind === "income");
   const spent = netExpense(current);
@@ -271,11 +278,13 @@ function TransactionLine({ item, onClick }: { item: Transaction; onClick: () => 
   return <button className="transaction-line" onClick={onClick}><span className="category-icon" style={{ color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{initials(item.category)}</span><span className="transaction-main"><strong>{display.title}</strong><small>{display.merchant ? `${display.merchant} · ` : ""}{item.date} · {item.category}{item.counted === false ? " · 不计入" : ""}</small></span><b className={item.kind === "refund" || item.kind === "income" ? "positive" : ""}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{yuan(item.amount)}</b></button>;
 }
 
-function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, onAdd, onCounted, onGroupSave, onGroupDelete, onAssign }: {
+function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, onAdd, onCounted, onLink, onDetach, onGroupSave, onGroupDelete, onAssign }: {
   items: Transaction[]; groups: PurposeGroup[]; month: string; initialFilter: DetailFilter;
   onMonthVisible: (month: string) => void;
   onEdit: (item: Transaction) => void; onAdd: () => void;
   onCounted: (ids: string[], counted: boolean) => void;
+  onLink: (ids: string[], parentId: string, relation: RelationKind) => void;
+  onDetach: (ids: string[]) => void;
   onGroupSave: (group: PurposeGroup) => void; onGroupDelete: (id: string) => void;
   onAssign: (ids: string[], groupId: string, remove?: boolean) => void;
 }) {
@@ -289,6 +298,10 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   const [end, setEnd] = useState(month);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expandedRelations, setExpandedRelations] = useState<Set<string>>(new Set());
+  const [linkRequest, setLinkRequest] = useState<{ ids: string[]; parentId: string } | null>(null);
+  const [revealId, setRevealId] = useState<string | null>(null);
+  const relations = useMemo(() => relationIndex(items), [items]);
   const [groupName, setGroupName] = useState("");
   const [groupMonth, setGroupMonth] = useState("");
   const [editingGroup, setEditingGroup] = useState<string | null>(null);
@@ -298,6 +311,7 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   const menu = useRef<HTMLDivElement>(null);
   const menuOrigin = useRef<HTMLButtonElement | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
+  const [dropRecordId, setDropRecordId] = useState<string | null>(null);
   const [dragged, setDragged] = useState<{ ids: string[]; title: string } | null>(null);
   const dragPreview = useRef<HTMLDivElement>(null);
   const pointerDrag = useRef<{ ids: string[]; title: string; pointerId: number; x: number; y: number; currentX: number; currentY: number; moved: boolean } | null>(null);
@@ -323,11 +337,38 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   const timelineMonths = [...new Set([...scoped.map((item) => item.date.slice(0, 7)), ...visibleGroups.map((group) => group.month), ...(scope === "all" || scope === "month" ? [month] : [])])].sort().reverse();
   const firstTimelineMonth = timelineMonths[0];
   const canExclude = selectedItems.some(counts);
-  const canRestore = selectedItems.some((item) => item.counted === false && item.kind !== "repayment" && item.kind !== "transfer");
+  const canRestore = selectedItems.some((item) => !counts(item));
   const filterCount = [source, category, merchant, tag].filter(Boolean).length;
   const contextItem = items.find((item) => item.id === contextMenu?.id);
   const movingIds = useMemo(() => new Set(dragged?.ids), [dragged]);
   const dropTarget = groups.find((group) => group.id === dragOver);
+  const dropRecord = relations.byId.get(dropRecordId ?? "");
+
+  useEffect(() => {
+    if (!revealId) return;
+    let root = relations.byId.get(revealId);
+    while (root?.parentId && relations.byId.has(root.parentId)) root = relations.byId.get(root.parentId);
+    const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-record-id]") ?? [])].find((row) => row.dataset.recordId === revealId && row.closest<HTMLElement>("[data-month]")?.dataset.month === root?.date.slice(0, 7));
+    if (!target) return;
+    userScrolling.current = false;
+    const offset = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + (window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0) + 20;
+    window.scrollTo({ top: Math.max(0, scrollY + target.getBoundingClientRect().top - offset), behavior: "auto" });
+    target.querySelector<HTMLButtonElement>(".detail-select")?.focus({ preventScroll: true });
+    setRevealId(null);
+  }, [revealId, expanded, expandedRelations, scope, relations]);
+
+  function revealRecord(id: string) {
+    const item = relations.byId.get(id);
+    if (!item) return;
+    const ancestors: Transaction[] = [];
+    let parent = item.parentId ? relations.byId.get(item.parentId) : undefined;
+    while (parent) { ancestors.push(parent); parent = parent.parentId ? relations.byId.get(parent.parentId) : undefined; }
+    setExpandedRelations((old) => new Set([...old, ...ancestors.map((record) => record.id)]));
+    setExpanded((old) => new Set([...old, ...((ancestors.at(-1) ?? item).groupIds ?? [])]));
+    setQuery(""); setSource(""); setCategory(""); setMerchant(""); setTag(""); setScope("all");
+    onMonthVisible((ancestors.at(-1) ?? item).date.slice(0, 7));
+    setRevealId(id);
+  }
 
   function positionDragPreview(x: number, y: number) {
     if (!dragPreview.current) return;
@@ -378,6 +419,7 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   }, []);
 
   useEffect(() => {
+    if (revealId) { visibleMonth.current = month; return; }
     if (scope !== "all" || visibleMonth.current === month) return;
     const firstVisit = visibleMonth.current === null;
     visibleMonth.current = month;
@@ -386,7 +428,7 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-month]") ?? [])].find((section) => section.dataset.month === month);
     const toolbarHeight = window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0;
     if (target) window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) - toolbarHeight - 20), behavior: "auto" });
-  }, [month, scope, firstTimelineMonth]);
+  }, [month, scope, firstTimelineMonth, revealId]);
 
   useEffect(() => {
     if (scope !== "all") return;
@@ -472,7 +514,11 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     drag.currentX = event.clientX; drag.currentY = event.clientY;
     positionDragPreview(event.clientX, event.clientY);
     const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
-    setDragOver(folder?.dataset.groupId ?? null);
+    const row = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-record-id]");
+    const targetId = row?.dataset.recordId;
+    const recordTarget = targetId && !drag.ids.includes(targetId) ? targetId : null;
+    setDropRecordId(recordTarget);
+    setDragOver(recordTarget ? null : folder?.dataset.groupId ?? null);
     if (event.clientY < 100) { userScrolling.current = true; window.scrollBy(0, -30); }
     else if (event.clientY > window.innerHeight - 60) { userScrolling.current = true; window.scrollBy(0, 30); }
   }
@@ -480,10 +526,13 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     const drag = pointerDrag.current;
     if (!drag || drag.pointerId !== event.pointerId) return false;
     pointerDrag.current = null;
-    setDragged(null); setDragOver(null);
+    setDragged(null); setDragOver(null); setDropRecordId(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
-    if (!cancelled && drag?.moved && folder?.dataset.groupId) onAssign(drag.ids, folder.dataset.groupId);
+    const row = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-record-id]");
+    const targetId = row?.dataset.recordId;
+    if (!cancelled && drag.moved && targetId && !drag.ids.includes(targetId)) setLinkRequest({ ids: drag.ids, parentId: targetId });
+    else if (!cancelled && drag.moved && folder?.dataset.groupId) onAssign(drag.ids, folder.dataset.groupId);
     return drag.moved;
   }
   function openContextMenu(event: MouseEvent<HTMLDivElement>, item: Transaction, groupId?: string) {
@@ -492,7 +541,7 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     const bounds = event.currentTarget.getBoundingClientRect();
     setContextMenu({ id: item.id, groupId, x: event.clientX || bounds.left + 20, y: event.clientY || bounds.top + 20, showGroups: false });
   }
-  const rowProps = { selected, movingIds, onToggle: toggle, onEdit, onAssign, onPointerStart: pointerStart, onPointerMove: pointerMove, onPointerFinish: pointerFinish, onContextMenu: openContextMenu };
+  const rowProps = { selected, movingIds, dropRecordId, relations, expandedRelations, onExpandRelation: (id: string) => setExpandedRelations((old) => { const next = new Set(old); if (next.has(id)) next.delete(id); else next.add(id); return next; }), onReveal: revealRecord, onToggle: toggle, onEdit, onAssign, onPointerStart: pointerStart, onPointerMove: pointerMove, onPointerFinish: pointerFinish, onContextMenu: openContextMenu };
 
   return <div className={`details-page${dragged ? " is-dragging" : ""}`}>
     {contextMenu && contextItem && <div ref={menu} className="bill-context-menu" role="menu" tabIndex={-1} aria-label="账单操作" style={{ left: contextMenu.x, top: contextMenu.y }} onContextMenu={(event) => event.preventDefault()} onKeyDown={(event) => {
@@ -508,19 +557,23 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
       {contextMenu.showGroups ? <><button role="menuitem" onClick={() => setContextMenu({ ...contextMenu, showGroups: false })}>‹ 返回</button>{groups.filter((group) => group.month === contextItem.date.slice(0, 7)).map((group) => <button role="menuitem" key={group.id} onClick={() => { onAssign([contextItem.id], group.id); setContextMenu(null); }}>{group.name}</button>)}</> : <>
         <button role="menuitem" onClick={() => { toggle(contextItem.id); setContextMenu(null); }}>{selected.has(contextItem.id) ? "取消勾选" : "勾选这笔"}</button>
         <button role="menuitem" onClick={() => { onEdit(contextItem); setContextMenu(null); }}>编辑账单</button>
-        <button role="menuitem" disabled={!counts(contextItem) && (contextItem.kind === "repayment" || contextItem.kind === "transfer")} onClick={() => { onCounted([contextItem.id], !counts(contextItem)); setContextMenu(null); }}>{counts(contextItem) ? "设为不计入" : "恢复计入"}</button>
+        <button role="menuitem" onClick={() => { setLinkRequest({ ids: [contextItem.id], parentId: "" }); setContextMenu(null); }}>关联到其他账单…</button>
+        {relations.children.has(contextItem.id) && <button role="menuitem" onClick={() => { setSelected((old) => new Set([...old, ...relatedTransactions(relations, contextItem.id).map((item) => item.id)])); setContextMenu(null); }}>勾选关联组</button>}
+        {contextItem.parentId && <><button role="menuitem" disabled={!relations.byId.has(contextItem.parentId)} onClick={() => { revealRecord(contextItem.parentId!); setContextMenu(null); }}>查看主账单</button><button role="menuitem" onClick={() => { onDetach([contextItem.id]); setContextMenu(null); }}>解除关联</button></>}
+        <button role="menuitem" onClick={() => { onCounted([contextItem.id], !counts(contextItem)); setContextMenu(null); }}>{counts(contextItem) ? "设为不计入" : "恢复计入"}</button>
         <button role="menuitem" aria-haspopup="menu" disabled={!groups.some((group) => group.month === contextItem.date.slice(0, 7))} onClick={() => setContextMenu({ ...contextMenu, showGroups: true })}>移入分组 ›</button>
         {contextMenu.groupId && <button role="menuitem" onClick={() => { onAssign([contextItem.id], contextMenu.groupId!, true); setContextMenu(null); }}>移出当前分组</button>}
       </>}
     </div>}
-    {dragged && <div ref={dragPreview} className="drag-preview" role="status"><strong>正在移动 {dragged.ids.length} 条账单</strong><span>{dragged.title}{dragged.ids.length > 1 ? ` 等 ${dragged.ids.length} 条` : ""}</span><small>{dropTarget ? `松开移入「${dropTarget.name}」` : "拖入同月分组，松开完成移动"}</small></div>}
+    {linkRequest && <LinkDialog items={items} request={linkRequest} onClose={() => setLinkRequest(null)} onLink={(parentId, relation) => { onLink(linkRequest.ids, parentId, relation); setExpandedRelations((old) => new Set([...old, parentId])); setLinkRequest(null); }} />}
+    {dragged && <div ref={dragPreview} className="drag-preview" role="status"><strong>正在移动 {dragged.ids.length} 条账单</strong><span>{dragged.title}{dragged.ids.length > 1 ? ` 等 ${dragged.ids.length} 条` : ""}</span><small>{dropRecord ? `松开关联到「${displayTransaction(dropRecord).title}」` : dropTarget ? `松开移入「${dropTarget.name}」` : "拖到另一笔账单建立关联，或拖入同月分组"}</small></div>}
     <section className="detail-toolbar" aria-label="明细功能栏" ref={toolbar}>
       <div className="detail-tools"><h1>明细</h1><button className="primary create-group-button" aria-expanded={toolPanel === "group"} aria-controls="detail-group-options" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupMonth(""); setGroupError(""); setToolPanel(toolPanel === "group" ? null : "group"); }}><span aria-hidden="true">＋</span>新建分组</button><select aria-label="查看月份范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="range">月份范围</option></select><input type="search" aria-label="搜索账单" placeholder="搜索商品、商家、来源或分组" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="secondary" aria-expanded={toolPanel === "filters"} aria-controls="detail-filter-options" onClick={() => setToolPanel(toolPanel === "filters" ? null : "filters")}>筛选{filterCount ? ` (${filterCount})` : ""}</button><button className="secondary" onClick={onAdd}>补记一笔</button></div>
       {scope === "range" && <div className="organize-period"><label>从 <input aria-label="查看起始月份" type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input aria-label="查看结束月份" type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label>{!validRange && <span role="alert">请选择有效的月份范围</span>}</div>}
       <div id="detail-filter-options" className="tool-options" hidden={toolPanel !== "filters"}><div className="filters"><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div></div>
       <div id="detail-group-options" className="tool-options" hidden={toolPanel !== "group"}><form className="group-create" onSubmit={saveGroup}>{scope !== "month" && !editingGroup && <label>所属月份 <input aria-label="分组所属月份" type="month" min={scope === "range" ? start : undefined} max={scope === "range" ? end : undefined} value={groupMonth || month} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "创建分组"}</button><button type="button" onClick={() => { setToolPanel(null); setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button><span className="group-hint">每月独立，拖入同月账单整理</span></form>{groupError && <p className="import-error" role="alert">{groupError}</p>}</div>
       <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span>{(query || filterCount > 0) && <button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button>}</div>
-    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong title="退款扣除，还款、转账及不计入记录按 0 元计算">净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button disabled={!canExclude} onClick={() => onCounted(selectedItems.map((item) => item.id), false)}>设为不计入</button><button disabled={!canRestore} onClick={() => onCounted(selectedItems.map((item) => item.id), true)}>恢复计入</button><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selectedItems.length} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
+    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong title="退款扣除，不计入记录按 0 元计算">净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，“不计入”记录按 0 元计算；手动计入的转账、还款按支出计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button disabled={!canExclude} onClick={() => onCounted(selectedItems.map((item) => item.id), false)}>设为不计入</button><button disabled={!canRestore} onClick={() => onCounted(selectedItems.map((item) => item.id), true)}>恢复计入</button><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selectedItems.length} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
     </section>
     <div className="bill-timeline" ref={timeline}>{timelineMonths.map((timelineMonth) => {
       const monthly = visible.filter((item) => item.date.startsWith(timelineMonth));
@@ -545,6 +598,11 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
 }
 type BillRowActions = {
   movingIds: Set<string>;
+  dropRecordId: string | null;
+  relations: ReturnType<typeof relationIndex>;
+  expandedRelations: Set<string>;
+  onExpandRelation: (id: string) => void;
+  onReveal: (id: string) => void;
   onToggle: (id: string) => void; onEdit: (item: Transaction) => void;
   onAssign: (ids: string[], groupId: string, remove?: boolean) => void;
   onPointerStart: (event: PointerEvent<HTMLButtonElement>, item: Transaction) => void;
@@ -556,20 +614,37 @@ type BillRowActions = {
 function BillRows({ records, groupId, selected, ...actions }: BillRowActions & {
   records: Transaction[]; groupId?: string; selected: Set<string>;
 }) {
-    return groupTransactionsByDay(records).map(({ date, records: daily }) => <div className="day-group" key={date}>
-      <div className="day-heading"><strong>{date}</strong><span>净消费 ¥{yuan(netExpense(daily))}</span></div>
-      {daily.map((item) => <BillRow key={item.id} item={item} groupId={groupId} selected={selected.has(item.id)} {...actions} />)}
+    const recordIds = new Set(records.map((item) => item.id));
+    const roots = records.filter((item) => {
+      const parent = item.parentId ? actions.relations.byId.get(item.parentId) : undefined;
+      return !parent || parent.date !== item.date || !recordIds.has(parent.id);
+    });
+    return groupTransactionsByDay(roots).map(({ date, records: daily }) => <div className="day-group" key={date}>
+      <div className="day-heading"><strong>{date}</strong><span>净消费 ¥{yuan(netExpense(records.filter((item) => item.date === date)))}</span></div>
+      {daily.map((item) => <BillEntry key={item.id} item={item} groupId={groupId} selected={selected} {...actions} />)}
     </div>);
 
 }
 
-function BillRow({ item, groupId, selected, movingIds, onToggle, onEdit, onAssign, onPointerStart, onPointerMove, onPointerFinish, onContextMenu }: BillRowActions & {
+function BillEntry({ item, groupId, selected, ...actions }: BillRowActions & { item: Transaction; groupId?: string; selected: Set<string> }) {
+  const children = actions.relations.children.get(item.id) ?? [];
+  const parent = item.parentId ? actions.relations.byId.get(item.parentId) : undefined;
+  const opened = actions.expandedRelations.has(item.id);
+  return <div className="bill-entry">
+    {item.parentId && <div className="relation-caption"><span>{RELATION_NAMES[item.relation!]} · {parent && parent.date.slice(0, 7) !== item.date.slice(0, 7) ? "跨月关联" : parent && parent.date !== item.date ? "跨天关联" : "已关联"} · {item.date}</span>{parent ? <button onClick={() => actions.onReveal(parent.id)}>↗ 主账单：{displayTransaction(parent).title}</button> : <span>主账单尚未导入</span>}</div>}
+    <BillRow item={item} groupId={groupId} selected={selected.has(item.id)} {...actions} />
+    {children.length > 0 && <div className="relation-summary"><button aria-expanded={opened} onClick={() => actions.onExpandRelation(item.id)}>{opened ? "▾" : "▸"} {relatedTransactions(actions.relations, item.id).length - 1} 条关联记录 · 关联净花费 ¥{yuan(netExpense(relatedTransactions(actions.relations, item.id)))}</button><span>包含所有日期的关联记录</span></div>}
+    {opened && children.length > 0 && <div className="attached-records">{children.map((child) => <BillEntry key={child.id} item={child} selected={selected} groupId={groupId && child.groupIds?.includes(groupId) ? groupId : undefined} {...actions} />)}</div>}
+  </div>;
+}
+
+function BillRow({ item, groupId, selected, movingIds, dropRecordId, onToggle, onEdit, onAssign, onPointerStart, onPointerMove, onPointerFinish, onContextMenu }: BillRowActions & {
   item: Transaction; groupId?: string; selected: boolean;
 }) {
   const display = displayTransaction(item);
   const sources = transactionSources(item).join(" · ");
   const suppressClick = useRef(false);
-  return <div className={`detail-row${selected ? " is-selected" : ""}${!counts(item) ? " is-excluded" : ""}${movingIds.has(item.id) ? " is-moving" : ""}`} onContextMenu={(event) => onContextMenu(event, item, groupId)}>
+  return <div data-record-id={item.id} className={`detail-row${selected ? " is-selected" : ""}${!counts(item) ? " is-excluded" : ""}${movingIds.has(item.id) ? " is-moving" : ""}${dropRecordId === item.id ? " relation-drop-target" : ""}`} onContextMenu={(event) => onContextMenu(event, item, groupId)}>
     <button type="button" className="detail-select" aria-pressed={selected} aria-label={`${selected ? "取消勾选" : "勾选"} ${display.title}`} onClick={(event) => {
       if (!suppressClick.current || event.detail === 0) onToggle(item.id);
       suppressClick.current = false;
@@ -584,6 +659,22 @@ function BillRow({ item, groupId, selected, movingIds, onToggle, onEdit, onAssig
     </button>
     <div className="row-actions"><button type="button" onClick={() => onEdit(item)} aria-label={`编辑 ${display.title}`}>编辑</button>{groupId && <button type="button" onClick={() => onAssign([item.id], groupId, true)} aria-label={`将 ${display.title} 移出分组`}>移出</button>}</div>
   </div>;
+}
+
+function LinkDialog({ items, request, onClose, onLink }: { items: Transaction[]; request: { ids: string[]; parentId: string }; onClose: () => void; onLink: (parentId: string, relation: RelationKind) => void }) {
+  const [parentId, setParentId] = useState(request.parentId);
+  const [relation, setRelation] = useState<RelationKind>("followup");
+  const [query, setQuery] = useState("");
+  const [error, setError] = useState("");
+  const parent = items.find((item) => item.id === parentId);
+  const selectedIds = new Set(request.ids);
+  const candidates = items.filter((item) => !selectedIds.has(item.id) && [item.date, item.merchant, item.note].join(" ").toLowerCase().includes(query.trim().toLowerCase())).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 100);
+  if (parent && !candidates.some((item) => item.id === parent.id)) candidates.unshift(parent);
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    try { onLink(parentId, relation); } catch (reason) { setError(reason instanceof Error ? reason.message : "关联失败"); }
+  }
+  return <Modal title="关联账单" onClose={onClose}><form className="editor-form relation-form" onSubmit={submit}><p>将 {request.ids.length} 条记录贴到主账单下面。日期、分组和计入状态保持不变。</p><label>查找主账单<input type="search" placeholder="搜索商品、商家或日期" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label>主账单<select required value={parentId} onChange={(event) => { setParentId(event.target.value); setError(""); }}><option value="">选择主账单…</option>{candidates.map((item) => <option key={item.id} value={item.id}>{item.date} · {displayTransaction(item).title} · ¥{yuan(item.amount)}</option>)}</select></label>{parent && <div className="relation-parent-preview"><strong>{displayTransaction(parent).title}</strong><span>{parent.date} · {KIND_NAMES[parent.kind]} ¥{yuan(parent.amount)}</span></div>}<div className="relation-choices"><label aria-label="后续记录"><input type="radio" name="relation-kind" checked={relation === "followup"} onChange={() => setRelation("followup")} /><span><strong>后续记录</strong><small>退款、退票、改签等后续流水</small></span></label><label aria-label="附属消费"><input type="radio" name="relation-kind" checked={relation === "attachment"} onChange={() => setRelation("attachment")} /><span><strong>附属消费</strong><small>保险、配件、手续费等关联开支</small></span></label></div>{error && <p className="import-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary" disabled={!parent}>确认关联</button></div></form></Modal>;
 }
 
 function DataView({ items, groups, month, onImport, onClear, onExport }: { items: Transaction[]; groups: PurposeGroup[]; month: string; onImport: () => void; onClear: () => void; onExport: (count: number) => void }) {
@@ -649,9 +740,9 @@ function Editor({ initial, month, onClose, onSave, onDelete }: { initial: Transa
   function change<K extends keyof Transaction>(field: K, value: Transaction[K]) { setForm((current) => ({ ...current, [field]: value })); }
   function submit(event: FormEvent) {
     event.preventDefault();
-    onSave({ ...form, merchant: form.merchant.trim(), tags: [...new Set(tags.split(/[、,，#\s]+/).map((item) => item.trim()).filter(Boolean))], counted: form.kind === "repayment" || form.kind === "transfer" ? false : form.counted });
+    onSave({ ...form, merchant: form.merchant.trim(), tags: [...new Set(tags.split(/[、,，#\s]+/).map((item) => item.trim()).filter(Boolean))], counted: counts(form) });
   }
-  return <Modal title={initial ? "编辑记录" : "补记一笔"} onClose={onClose}><form className="editor-form" onSubmit={submit}><div className="form-grid"><label>日期<input type="date" required value={form.date} onChange={(event) => change("date", event.target.value)} /></label><label>金额（元）<input type="number" required min="0.01" step="0.01" value={form.amount || ""} onChange={(event) => change("amount", Number(event.target.value))} /></label><label>类型<select value={form.kind} onChange={(event) => { const kind = event.target.value as Kind; setForm((current) => ({ ...current, kind, counted: kind === "repayment" || kind === "transfer" ? false : current.kind === "repayment" || current.kind === "transfer" ? true : current.counted })); }}>{(Object.keys(KIND_NAMES) as Kind[]).map((kind) => <option value={kind} key={kind}>{KIND_NAMES[kind]}</option>)}</select></label><label>分类<select value={form.category} onChange={(event) => change("category", event.target.value)}>{[...new Set([...CATEGORIES, form.category])].map((name) => <option key={name}>{name}</option>)}</select></label></div><label>商家<input required value={form.merchant} onChange={(event) => change("merchant", event.target.value)} placeholder="例如：美团" /></label><label>商品或用途<input value={form.note ?? ""} onChange={(event) => change("note", event.target.value)} placeholder="例如：晚餐" /></label><label>标签<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="例如：外卖、聚餐" /></label>{form.kind !== "repayment" && form.kind !== "transfer" && <label className="counted-toggle"><input type="checkbox" checked={form.counted !== false} onChange={(event) => change("counted", event.target.checked)} />计入统计</label>}<div className="modal-actions">{onDelete && <button type="button" className="danger-button" onClick={onDelete}>删除</button>}<button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">保存</button></div></form></Modal>;
+  return <Modal title={initial ? "编辑记录" : "补记一笔"} onClose={onClose}><form className="editor-form" onSubmit={submit}><div className="form-grid"><label>日期<input type="date" required value={form.date} onChange={(event) => change("date", event.target.value)} /></label><label>金额（元）<input type="number" required min="0.01" step="0.01" value={form.amount || ""} onChange={(event) => change("amount", Number(event.target.value))} /></label><label>类型<select value={form.kind} onChange={(event) => { const kind = event.target.value as Kind; setForm((current) => ({ ...current, kind, counted: kind === "repayment" || kind === "transfer" ? false : current.kind === "repayment" || current.kind === "transfer" ? true : current.counted })); }}>{(Object.keys(KIND_NAMES) as Kind[]).map((kind) => <option value={kind} key={kind}>{KIND_NAMES[kind]}</option>)}</select></label><label>分类<select value={form.category} onChange={(event) => change("category", event.target.value)}>{[...new Set([...CATEGORIES, form.category])].map((name) => <option key={name}>{name}</option>)}</select></label></div><label>商家<input required value={form.merchant} onChange={(event) => change("merchant", event.target.value)} placeholder="例如：美团" /></label><label>商品或用途<input value={form.note ?? ""} onChange={(event) => change("note", event.target.value)} placeholder="例如：晚餐" /></label><label>标签<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="例如：外卖、聚餐" /></label><label className="counted-toggle"><input type="checkbox" checked={counts(form)} onChange={(event) => change("counted", event.target.checked)} />计入统计</label><div className="modal-actions">{onDelete && <button type="button" className="danger-button" onClick={onDelete}>删除</button>}<button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">保存</button></div></form></Modal>;
 }
 
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
