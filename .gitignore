@@ -12,6 +12,7 @@
 .env*
 
 # Editor and operating-system files
+/AGENTS.md
 .DS_Store
 Thumbs.db
 *.pem
