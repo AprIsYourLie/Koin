@@ -60,6 +60,21 @@ export function counts(item: Transaction) {
   return item.counted !== false && item.kind !== "repayment" && item.kind !== "transfer";
 }
 
+export function setCounted(items: Transaction[], ids: string[], counted: boolean) {
+  const selected = new Set(ids);
+  return items.map((item) => selected.has(item.id) && (!counted || (item.kind !== "repayment" && item.kind !== "transfer")) ? { ...item, counted } : item);
+}
+
+export function groupTransactionsByDay(items: Transaction[]) {
+  const days = new Map<string, Transaction[]>();
+  const sorted = [...items].sort((left, right) => right.date.localeCompare(left.date) || Number(!counts(left)) - Number(!counts(right)) || left.id.localeCompare(right.id));
+  for (const item of sorted) {
+    if (!days.has(item.date)) days.set(item.date, []);
+    days.get(item.date)!.push(item);
+  }
+  return [...days].map(([date, records]) => ({ date, records }));
+}
+
 export function netExpense(items: Transaction[]) {
   return items.reduce((sum, item) => sum + (counts(item) ? item.kind === "expense" ? item.amount : item.kind === "refund" ? -item.amount : 0 : 0), 0);
 }

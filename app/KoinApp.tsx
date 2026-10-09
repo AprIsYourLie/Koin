@@ -2,7 +2,7 @@ import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, us
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction,
-  assignGroup, groupsInRange, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, transactionSources,
+  assignGroup, groupsInRange, groupTransactionsByDay, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, setCounted, transactionSources,
   type ImportPreview, type Kind, type Transaction, type PurposeGroup,
 } from "./billModel";
 
@@ -10,6 +10,15 @@ type View = "overview" | "details" | "data";
 type DetailFilter = { category?: string; merchant?: string; tag?: string };
 
 const KIND_NAMES: Record<Kind, string> = { expense: "支出", refund: "退款", income: "收入", repayment: "还款", transfer: "转账" };
+const FONT_SIZES = [100, 115, 130, 150];
+const FONT_KEY = "koin.fontScale.v1";
+
+function loadFontSize() {
+  try {
+    const value = Number(localStorage.getItem(FONT_KEY));
+    return FONT_SIZES.includes(value) ? value : 100;
+  } catch { return 100; }
+}
 
 function monthNow() {
   const now = new Date();
@@ -82,6 +91,20 @@ export default function KoinApp() {
   const [importOpen, setImportOpen] = useState(false);
   const [editing, setEditing] = useState<Transaction | null | undefined>(undefined);
   const [toast, setToast] = useState("");
+  const [fontSize, setFontSize] = useState(loadFontSize);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--font-scale", String(fontSize / 100));
+    localStorage.setItem(FONT_KEY, String(fontSize));
+  }, [fontSize]);
+
+  useEffect(() => {
+    const header = document.querySelector(".topbar");
+    if (!header) return;
+    const observer = new ResizeObserver(() => document.documentElement.style.setProperty("--topbar-height", `${header.getBoundingClientRect().height}px`));
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(STORE_KEY, JSON.stringify(createBook(transactions, groups)));
@@ -146,12 +169,15 @@ export default function KoinApp() {
           <label><span>当前月份</span><input aria-label="选择月份" type="month" value={month} onChange={(event) => setMonth(event.target.value)} /></label>
           <button onClick={() => setMonth(shiftMonth(month, 1))} aria-label="下个月">›</button>
         </div>
-        <div className="top-actions"><button className="secondary" onClick={() => setEditing(null)}>补记</button><button className="primary" onClick={() => setImportOpen(true)}>导入 JSON</button></div>
+        <div className="top-actions"><label className="font-size-control">字号<select aria-label="字体大小" value={fontSize} onChange={(event) => setFontSize(Number(event.target.value))}>{FONT_SIZES.map((size) => <option key={size} value={size}>{size}%</option>)}</select></label><button className="secondary" onClick={() => setEditing(null)}>补记</button><button className="primary" onClick={() => setImportOpen(true)}>导入 JSON</button></div>
       </header>
 
       <div className="content">
         {view === "overview" && <Overview current={current} all={transactions} month={month} onImport={() => setImportOpen(true)} onDetails={openDetails} />}
-        {view === "details" && <Details key={month} items={transactions} groups={groups} month={month} initialFilter={detailFilter} onEdit={setEditing} onAdd={() => setEditing(null)} onGroupSave={(group) => setGroups((old) => old.some((item) => item.id === group.id) ? old.map((item) => item.id === group.id ? group : item) : [...old, group])} onGroupDelete={(id) => {
+        {view === "details" && <Details items={transactions} groups={groups} month={month} onMonthVisible={setMonth} initialFilter={detailFilter} onEdit={setEditing} onAdd={() => setEditing(null)} onCounted={(ids, counted) => {
+          setTransactions((old) => setCounted(old, ids, counted));
+          setToast(counted ? "已恢复计入统计" : "已设为不计入统计");
+        }} onGroupSave={(group) => setGroups((old) => old.some((item) => item.id === group.id) ? old.map((item) => item.id === group.id ? group : item) : [...old, group])} onGroupDelete={(id) => {
           if (!window.confirm("删除这个分组？组内账单会回到未分组列表。")) return;
           setGroups((old) => old.filter((group) => group.id !== id));
           setTransactions((old) => assignGroup(old, old.map((item) => item.id), id, true));
@@ -245,9 +271,11 @@ function TransactionLine({ item, onClick }: { item: Transaction; onClick: () => 
   return <button className="transaction-line" onClick={onClick}><span className="category-icon" style={{ color: CATEGORY_COLORS[item.category] ?? CATEGORY_COLORS.其他 }}>{initials(item.category)}</span><span className="transaction-main"><strong>{display.title}</strong><small>{display.merchant ? `${display.merchant} · ` : ""}{item.date} · {item.category}{item.counted === false ? " · 不计入" : ""}</small></span><b className={item.kind === "refund" || item.kind === "income" ? "positive" : ""}>{item.kind === "refund" || item.kind === "income" ? "+" : "−"} ¥{yuan(item.amount)}</b></button>;
 }
 
-function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSave, onGroupDelete, onAssign }: {
+function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, onAdd, onCounted, onGroupSave, onGroupDelete, onAssign }: {
   items: Transaction[]; groups: PurposeGroup[]; month: string; initialFilter: DetailFilter;
+  onMonthVisible: (month: string) => void;
   onEdit: (item: Transaction) => void; onAdd: () => void;
+  onCounted: (ids: string[], counted: boolean) => void;
   onGroupSave: (group: PurposeGroup) => void; onGroupDelete: (id: string) => void;
   onAssign: (ids: string[], groupId: string, remove?: boolean) => void;
 }) {
@@ -256,18 +284,21 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
   const [merchant, setMerchant] = useState(initialFilter.merchant ?? "");
   const [tag, setTag] = useState(initialFilter.tag ?? "");
   const [source, setSource] = useState("");
-  const [scope, setScope] = useState<"month" | "range" | "all">("month");
+  const [scope, setScope] = useState<"month" | "range" | "all">("all");
   const [start, setStart] = useState(month);
   const [end, setEnd] = useState(month);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [groupName, setGroupName] = useState("");
-  const [groupMonth, setGroupMonth] = useState(month);
+  const [groupMonth, setGroupMonth] = useState("");
   const [editingGroup, setEditingGroup] = useState<string | null>(null);
   const [groupError, setGroupError] = useState("");
   const [dragOver, setDragOver] = useState<string | null>(null);
   const [draggedCount, setDraggedCount] = useState(0);
   const pointerDrag = useRef<{ ids: string[]; pointerId: number; x: number; y: number; moved: boolean } | null>(null);
+  const timeline = useRef<HTMLDivElement>(null);
+  const visibleMonth = useRef<string | null>(null);
+  const userScrolling = useRef(false);
   const validRange = scope !== "range" || Boolean(start && end && start <= end);
   const visibleGroups = validRange ? groupsInRange(groups, scope === "all" ? undefined : scope === "month" ? month : start, scope === "month" ? month : end) : [];
   const scoped = items.filter((item) => validRange && (scope === "all" || (item.date.slice(0, 7) >= (scope === "month" ? month : start) && item.date.slice(0, 7) <= (scope === "month" ? month : end))));
@@ -283,7 +314,63 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
   }).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id));
   const selectedItems = items.filter((item) => selected.has(item.id));
   const allVisibleSelected = visible.length > 0 && visible.every((item) => selected.has(item.id));
-  const ungrouped = visible.filter((item) => !groups.some((group) => item.groupIds?.includes(group.id)));
+  const timelineMonths = [...new Set([...scoped.map((item) => item.date.slice(0, 7)), ...visibleGroups.map((group) => group.month), ...(scope === "all" || scope === "month" ? [month] : [])])].sort().reverse();
+  const firstTimelineMonth = timelineMonths[0];
+  const canExclude = selectedItems.some(counts);
+  const canRestore = selectedItems.some((item) => item.counted === false && item.kind !== "repayment" && item.kind !== "transfer");
+
+  useEffect(() => {
+    if (scope !== "all" || visibleMonth.current === month) return;
+    const firstVisit = visibleMonth.current === null;
+    visibleMonth.current = month;
+    userScrolling.current = false;
+    if (firstVisit && month === firstTimelineMonth) return;
+    const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-month]") ?? [])].find((section) => section.dataset.month === month);
+    const toolbar = window.innerWidth > 980 ? document.querySelector(".selected-summary")?.getBoundingClientRect().height ?? 0 : 0;
+    if (target) window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) - toolbar - 20), behavior: "auto" });
+  }, [month, scope, firstTimelineMonth]);
+
+  useEffect(() => {
+    if (scope !== "all") return;
+    let frame = 0;
+    function updateMonth() {
+      frame = 0;
+      const toolbar = window.innerWidth > 980 ? document.querySelector(".selected-summary")?.getBoundingClientRect().height ?? 0 : 0;
+      const marker = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + toolbar + 24;
+      const sections = timeline.current?.querySelectorAll<HTMLElement>("[data-month]") ?? [];
+      for (const section of sections) {
+        const rect = section.getBoundingClientRect();
+        if (rect.bottom > marker && section.dataset.month) {
+          if (section.dataset.month !== visibleMonth.current) {
+            visibleMonth.current = section.dataset.month;
+            onMonthVisible(section.dataset.month);
+          }
+          break;
+        }
+      }
+    }
+    function onScroll() { if (userScrolling.current && !frame) frame = requestAnimationFrame(updateMonth); }
+    function allowScroll() { userScrolling.current = true; }
+    function onPointerDown(event: globalThis.PointerEvent) {
+      userScrolling.current = event.clientX >= document.documentElement.clientWidth;
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.target as HTMLElement).closest("input,select,textarea")) return;
+      if (["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", " "].includes(event.key)) allowScroll();
+    }
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    window.addEventListener("wheel", allowScroll, { passive: true });
+    window.addEventListener("touchmove", allowScroll, { passive: true });
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("scroll", onScroll); window.removeEventListener("resize", onScroll);
+      window.removeEventListener("wheel", allowScroll); window.removeEventListener("touchmove", allowScroll);
+      window.removeEventListener("pointerdown", onPointerDown); window.removeEventListener("keydown", onKeyDown);
+      cancelAnimationFrame(frame);
+    };
+  }, [scope, onMonthVisible]);
 
   function toggle(id: string) {
     setSelected((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
@@ -298,7 +385,7 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
     event.preventDefault();
     const name = groupName.trim();
     if (!name) { setGroupError("请输入分组名称"); return; }
-    const targetMonth = editingGroup ? groups.find((group) => group.id === editingGroup)!.month : scope === "month" ? month : groupMonth;
+    const targetMonth = editingGroup ? groups.find((group) => group.id === editingGroup)!.month : scope === "month" ? month : groupMonth || month;
     if (!targetMonth || !validRange || (scope === "range" && (targetMonth < start || targetMonth > end))) { setGroupError("请选择查看范围内的月份"); return; }
     if (groups.some((group) => group.month === targetMonth && group.name === name && group.id !== editingGroup)) { setGroupError("这个月已存在同名分组"); return; }
     const id = editingGroup ?? crypto.randomUUID();
@@ -327,8 +414,8 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
     setDraggedCount(drag.ids.length);
     const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
     setDragOver(folder?.dataset.groupId ?? null);
-    if (event.clientY < 100) window.scrollBy(0, -30);
-    else if (event.clientY > window.innerHeight - 60) window.scrollBy(0, 30);
+    if (event.clientY < 100) { userScrolling.current = true; window.scrollBy(0, -30); }
+    else if (event.clientY > window.innerHeight - 60) { userScrolling.current = true; window.scrollBy(0, 30); }
   }
   function pointerFinish(event: PointerEvent<HTMLButtonElement>, cancelled = false) {
     const drag = pointerDrag.current;
@@ -344,28 +431,37 @@ function Details({ items, groups, month, initialFilter, onEdit, onAdd, onGroupSa
 
   return <div className="details-page">
     {draggedCount > 0 && <div className="drag-status" role="status">正在拖动 {draggedCount} 条账单 · 松开到分组中</div>}
-    <div className="view-heading"><div><span className="eyebrow">账单整理</span><h1>{scope === "month" ? formatMonth(month) : scope === "all" ? "全部月份" : "月份范围"}</h1><p>分好组的放在上面，其他账单在下面继续整理。</p></div><button className="secondary" onClick={onAdd}>补记一笔</button></div>
+    <div className="view-heading"><div><span className="eyebrow">账单整理</span><h1>账单明细</h1><p>向上查看更新的月份，向下查看更早的月份；每月栏目独立。</p></div><button className="secondary" onClick={onAdd}>补记一笔</button></div>
     <section className="panel filter-panel">
-      <div className="organize-period"><label>查看范围 <select aria-label="查看月份范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="month">当前月份</option><option value="range">连续多月</option><option value="all">全部月份</option></select></label>{scope === "range" && <><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></>}{!validRange && <span role="alert">请选择有效的月份范围</span>}</div>
+      <div className="organize-period"><label>查看范围 <select aria-label="查看月份范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="range">月份范围</option></select></label>{scope === "range" && <><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></>}{!validRange && <span role="alert">请选择有效的月份范围</span>}</div>
       <div className="filters"><input type="search" placeholder="搜索商品、商家、来源或分组" value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div>
       <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span><button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button></div>
     </section>
-    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
+    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button disabled={!canExclude} onClick={() => onCounted(selectedItems.map((item) => item.id), false)}>设为不计入</button><button disabled={!canRestore} onClick={() => onCounted(selectedItems.map((item) => item.id), true)}>恢复计入</button><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
     <section className="purpose-groups" aria-label="用途分组">
       <div className="group-section-heading"><h2>用途分组</h2><span>每月独立，拖入同月账单整理</span></div>
-      <form className="group-create" onSubmit={saveGroup}>{scope !== "month" && !editingGroup && <label>新建月份 <input aria-label="分组所属月份" type="month" min={scope === "range" ? start : undefined} max={scope === "range" ? end : undefined} value={groupMonth} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "新建分组"}</button>{editingGroup && <button type="button" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button>}</form>
+      <form className="group-create" onSubmit={saveGroup}>{scope !== "month" && !editingGroup && <label>新建月份 <input aria-label="分组所属月份" type="month" min={scope === "range" ? start : undefined} max={scope === "range" ? end : undefined} value={groupMonth || month} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "新建分组"}</button>{editingGroup && <button type="button" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button>}</form>
       {groupError && <p className="import-error" role="alert">{groupError}</p>}
-      {visibleGroups.map((group) => {
-        const records = visible.filter((item) => item.groupIds?.includes(group.id));
+    </section>
+    <div className="bill-timeline" ref={timeline}>{timelineMonths.map((timelineMonth) => {
+      const monthly = visible.filter((item) => item.date.startsWith(timelineMonth));
+      const monthlyGroups = visibleGroups.filter((group) => group.month === timelineMonth);
+      const ungrouped = monthly.filter((item) => !monthlyGroups.some((group) => item.groupIds?.includes(group.id)));
+      return <section className="month-ledger" key={timelineMonth} data-month={timelineMonth} aria-label={`${formatMonth(timelineMonth)}账单`}>
+      <div className="month-heading"><h2>{formatMonth(timelineMonth)}</h2><span>{monthly.length} 笔 · 净消费 ¥{yuan(netExpense(monthly))}</span></div>
+      <div className="folder-grid">{monthlyGroups.map((group) => {
+        const records = monthly.filter((item) => item.groupIds?.includes(group.id));
+        const excludedCount = records.filter((item) => !counts(item)).length;
         const total = netExpense(items.filter((item) => item.groupIds?.includes(group.id)));
         return <section key={group.id} data-group-id={group.id} className={`panel purpose-folder${dragOver === group.id ? " drag-over" : ""}`} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDragOver(group.id); } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragOver(null); }} onDrop={(event) => drop(event, group.id)}>
           <div className="folder-heading"><button className="folder-toggle" aria-expanded={expanded.has(group.id)} onClick={() => toggleGroup(group.id)}><span aria-hidden="true">{expanded.has(group.id) ? "▾" : "▸"} ▰</span><strong>{group.name}</strong><span>{records.length} 笔</span><b>¥{yuan(netExpense(records))}</b></button><div className="folder-actions"><button onClick={() => setSelected((old) => new Set([...old, ...records.map((item) => item.id)]))} disabled={!records.length}>勾选组内</button><button onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); }}>改名</button><button onClick={() => onGroupDelete(group.id)}>删除分组</button></div></div>
-          <div className="folder-caption">{formatMonth(group.month)} · 本月分组累计 ¥{yuan(total)}</div>
+          <div className="folder-caption">本月分组累计 ¥{yuan(total)}{excludedCount ? ` · ${excludedCount} 条不计入` : ""}</div>
           {expanded.has(group.id) && <div className="folder-records">{records.length ? <BillRows records={records} groupId={group.id} {...rowProps} /> : <p className="small-empty">当前范围没有账单，可以拖入账单到这个分组。</p>}</div>}
         </section>;
-      })}
-    </section>
+      })}</div>
     <section className="panel day-list"><div className="ungrouped-heading"><h2>未分组账单</h2><span>{ungrouped.length} 笔 · 净消费 ¥{yuan(netExpense(ungrouped))}</span></div>{ungrouped.length ? <BillRows records={ungrouped} {...rowProps} /> : <p className="small-empty">当前范围没有未分组账单</p>}</section>
+    </section>;
+    })}</div>
   </div>;
 }
 type BillRowActions = {
@@ -379,10 +475,9 @@ type BillRowActions = {
 function BillRows({ records, groupId, selected, ...actions }: BillRowActions & {
   records: Transaction[]; groupId?: string; selected: Set<string>;
 }) {
-    const days = [...new Set(records.map((item) => item.date))];
-    return days.map((day) => <div className="day-group" key={day}>
-      <div className="day-heading"><strong>{day}</strong><span>净消费 ¥{yuan(netExpense(records.filter((item) => item.date === day)))}</span></div>
-      {records.filter((item) => item.date === day).map((item) => <BillRow key={item.id} item={item} groupId={groupId} selected={selected.has(item.id)} {...actions} />)}
+    return groupTransactionsByDay(records).map(({ date, records: daily }) => <div className="day-group" key={date}>
+      <div className="day-heading"><strong>{date}</strong><span>净消费 ¥{yuan(netExpense(daily))}</span></div>
+      {daily.map((item) => <BillRow key={item.id} item={item} groupId={groupId} selected={selected.has(item.id)} {...actions} />)}
     </div>);
 
 }
@@ -393,7 +488,7 @@ function BillRow({ item, groupId, selected, onToggle, onEdit, onAssign, onPointe
   const display = displayTransaction(item);
   const sources = transactionSources(item).join(" · ");
   const suppressClick = useRef(false);
-  return <div className={`detail-row${selected ? " is-selected" : ""}`}>
+  return <div className={`detail-row${selected ? " is-selected" : ""}${!counts(item) ? " is-excluded" : ""}`}>
     <button type="button" className="detail-select" aria-pressed={selected} aria-label={`${selected ? "取消勾选" : "勾选"} ${display.title}`} onClick={(event) => {
       if (!suppressClick.current || event.detail === 0) onToggle(item.id);
       suppressClick.current = false;

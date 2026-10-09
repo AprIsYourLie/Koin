@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assignGroup, counts, createBook, displayTransaction, groupsInRange, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, transactionSources } from "../app/billModel.ts";
+import { assignGroup, counts, createBook, displayTransaction, groupsInRange, groupTransactionsByDay, mergeGroups, monthEnd, netExpense, planImport, readBook, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
 
@@ -30,6 +30,36 @@ test("refund reduces selected net total and transfers never count", () => {
   const rows = [expense("e", "2026-07-01"), expense("r", "2026-07-02", { kind: "refund", amount: 8 }), expense("t", "2026-07-03", { kind: "transfer", amount: 100 }), expense("x", "2026-07-04", { counted: false, amount: 12 })];
   assert.equal(netExpense(rows), 20);
   assert.equal(netExpense(rows.slice(1)), -8);
+});
+
+test("batch inclusion changes totals and round-trips without losing group, source or local edits", () => {
+  const rows = [expense("buy", "2026-09-02", { amount: 100, groupIds: ["kitchen"], source: "支付宝", note: "我改过的炒锅" }), expense("refund", "2026-09-02", { kind: "refund", amount: 20 }), expense("income", "2026-09-02", { kind: "income", amount: 300 }), expense("transfer", "2026-09-02", { kind: "transfer", counted: false })];
+  const groups = [{ id: "kitchen", name: "厨具", month: "2026-09" }];
+  const excluded = setCounted(rows, ["buy", "refund", "income"], false);
+  assert.equal(netExpense(excluded), 0);
+  assert.equal(netExpense(rows), 80);
+  const restored = readBook(JSON.parse(JSON.stringify(createBook(excluded, groups)))).transactions;
+  const purchase = restored.find((item) => item.id === "buy");
+  assert.equal(purchase.counted, false);
+  assert.deepEqual(purchase.groupIds, ["kitchen"]);
+  assert.equal(purchase.source, "支付宝");
+  assert.equal(purchase.note, "我改过的炒锅");
+  assert.deepEqual(purchase.tags, ["外卖"]);
+  const reenabled = setCounted(restored, restored.map((item) => item.id), true);
+  assert.equal(netExpense(reenabled), 80);
+  assert.equal(reenabled.find((item) => item.id === "transfer").counted, false);
+  assert.equal(counts(reenabled.find((item) => item.id === "income")), true);
+  assert.equal(planImport(excluded, createBook(rows, groups), groups).added.length, 0);
+  assert.equal(excluded[0].counted, false);
+});
+
+test("exclusions sink within their own day while months and days stay newest first", () => {
+  const rows = [expense("excluded", "2026-09-30", { counted: false }), expense("older", "2026-09-29"), expense("included", "2026-09-30"), expense("oct", "2026-10-01"), expense("transfer", "2026-09-30", { kind: "transfer" })];
+  const days = groupTransactionsByDay(rows);
+  assert.deepEqual(days.map((day) => day.date), ["2026-10-01", "2026-09-30", "2026-09-29"]);
+  assert.deepEqual(days[1].records.map((item) => item.id), ["included", "excluded", "transfer"]);
+  assert.equal(netExpense(days[1].records), 28);
+  assert.equal(rows[0].id, "excluded");
 });
 
 test("month and whole-book exports round-trip manual edits", () => {
