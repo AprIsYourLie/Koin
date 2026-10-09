@@ -1,4 +1,4 @@
-import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, MouseEvent, PointerEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction,
@@ -293,10 +293,16 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   const [groupMonth, setGroupMonth] = useState("");
   const [editingGroup, setEditingGroup] = useState<string | null>(null);
   const [groupError, setGroupError] = useState("");
+  const [toolPanel, setToolPanel] = useState<"filters" | "group" | null>(() => Object.values(initialFilter).some(Boolean) ? "filters" : null);
+  const [contextMenu, setContextMenu] = useState<{ id: string; groupId?: string; x: number; y: number; showGroups: boolean } | null>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  const menuOrigin = useRef<HTMLButtonElement | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
-  const [draggedCount, setDraggedCount] = useState(0);
-  const pointerDrag = useRef<{ ids: string[]; pointerId: number; x: number; y: number; moved: boolean } | null>(null);
+  const [dragged, setDragged] = useState<{ ids: string[]; title: string } | null>(null);
+  const dragPreview = useRef<HTMLDivElement>(null);
+  const pointerDrag = useRef<{ ids: string[]; title: string; pointerId: number; x: number; y: number; currentX: number; currentY: number; moved: boolean } | null>(null);
   const timeline = useRef<HTMLDivElement>(null);
+  const toolbar = useRef<HTMLElement>(null);
   const visibleMonth = useRef<string | null>(null);
   const userScrolling = useRef(false);
   const validRange = scope !== "range" || Boolean(start && end && start <= end);
@@ -318,6 +324,58 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   const firstTimelineMonth = timelineMonths[0];
   const canExclude = selectedItems.some(counts);
   const canRestore = selectedItems.some((item) => item.counted === false && item.kind !== "repayment" && item.kind !== "transfer");
+  const filterCount = [source, category, merchant, tag].filter(Boolean).length;
+  const contextItem = items.find((item) => item.id === contextMenu?.id);
+  const movingIds = useMemo(() => new Set(dragged?.ids), [dragged]);
+  const dropTarget = groups.find((group) => group.id === dragOver);
+
+  function positionDragPreview(x: number, y: number) {
+    if (!dragPreview.current) return;
+    const left = Math.max(12, Math.min(x + 16, window.innerWidth - Math.min(260, window.innerWidth - 24) - 12));
+    const top = Math.max(12, Math.min(y + 16, window.innerHeight - 108));
+    dragPreview.current.style.transform = `translate3d(${left}px, ${top}px, 0)`;
+  }
+
+  useLayoutEffect(() => {
+    const drag = pointerDrag.current;
+    if (dragged && drag) positionDragPreview(drag.currentX, drag.currentY);
+  }, [dragged]);
+
+  useLayoutEffect(() => {
+    if (!contextMenu || !menu.current) return;
+    const bounds = menu.current.getBoundingClientRect();
+    const x = Math.max(12, Math.min(contextMenu.x, window.innerWidth - bounds.width - 12));
+    const y = Math.max(12, Math.min(contextMenu.y, window.innerHeight - bounds.height - 12));
+    if (x !== contextMenu.x || y !== contextMenu.y) setContextMenu({ ...contextMenu, x, y });
+    menu.current.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    function dismiss(event: Event) { if (!(event.target instanceof Node) || !menu.current?.contains(event.target)) setContextMenu(null); }
+    function escape(event: KeyboardEvent) { if (event.key === "Escape") { event.preventDefault(); setContextMenu(null); menuOrigin.current?.focus(); } }
+    function close() { setContextMenu(null); }
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", escape);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    const element = toolbar.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() => document.documentElement.style.setProperty("--detail-toolbar-height", `${element.getBoundingClientRect().height}px`));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (scope !== "all" || visibleMonth.current === month) return;
@@ -326,8 +384,8 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     userScrolling.current = false;
     if (firstVisit && month === firstTimelineMonth) return;
     const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-month]") ?? [])].find((section) => section.dataset.month === month);
-    const toolbar = window.innerWidth > 980 ? document.querySelector(".selected-summary")?.getBoundingClientRect().height ?? 0 : 0;
-    if (target) window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) - toolbar - 20), behavior: "auto" });
+    const toolbarHeight = window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0;
+    if (target) window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) - toolbarHeight - 20), behavior: "auto" });
   }, [month, scope, firstTimelineMonth]);
 
   useEffect(() => {
@@ -335,8 +393,8 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     let frame = 0;
     function updateMonth() {
       frame = 0;
-      const toolbar = window.innerWidth > 980 ? document.querySelector(".selected-summary")?.getBoundingClientRect().height ?? 0 : 0;
-      const marker = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + toolbar + 24;
+      const toolbarHeight = window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0;
+      const marker = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + toolbarHeight + 24;
       const sections = timeline.current?.querySelectorAll<HTMLElement>("[data-month]") ?? [];
       for (const section of sections) {
         const rect = section.getBoundingClientRect();
@@ -390,8 +448,8 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     if (groups.some((group) => group.month === targetMonth && group.name === name && group.id !== editingGroup)) { setGroupError("这个月已存在同名分组"); return; }
     const id = editingGroup ?? crypto.randomUUID();
     onGroupSave({ id, name, month: targetMonth });
-    setExpanded((old) => new Set([...old, id]));
     setEditingGroup(null); setGroupName(""); setGroupError("");
+    setToolPanel(null);
   }
   function drop(event: DragEvent, groupId: string) {
     event.preventDefault(); setDragOver(null);
@@ -404,14 +462,15 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     if (event.button !== 0 || !event.isPrimary || pointerDrag.current) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     const ids = selected.has(item.id) ? selectedItems.map((record) => record.id) : [item.id];
-    pointerDrag.current = { ids, pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+    pointerDrag.current = { ids, title: displayTransaction(item).title, pointerId: event.pointerId, x: event.clientX, y: event.clientY, currentX: event.clientX, currentY: event.clientY, moved: false };
   }
   function pointerMove(event: PointerEvent<HTMLButtonElement>) {
     const drag = pointerDrag.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 6 && !drag.moved) return;
-    drag.moved = true;
-    setDraggedCount(drag.ids.length);
+    if (!drag.moved) { drag.moved = true; setContextMenu(null); setDragged({ ids: drag.ids, title: drag.title }); }
+    drag.currentX = event.clientX; drag.currentY = event.clientY;
+    positionDragPreview(event.clientX, event.clientY);
     const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
     setDragOver(folder?.dataset.groupId ?? null);
     if (event.clientY < 100) { userScrolling.current = true; window.scrollBy(0, -30); }
@@ -421,27 +480,47 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
     const drag = pointerDrag.current;
     if (!drag || drag.pointerId !== event.pointerId) return false;
     pointerDrag.current = null;
-    setDraggedCount(0); setDragOver(null);
+    setDragged(null); setDragOver(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     const folder = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-group-id]");
     if (!cancelled && drag?.moved && folder?.dataset.groupId) onAssign(drag.ids, folder.dataset.groupId);
     return drag.moved;
   }
-  const rowProps = { selected, onToggle: toggle, onEdit, onAssign, onPointerStart: pointerStart, onPointerMove: pointerMove, onPointerFinish: pointerFinish };
+  function openContextMenu(event: MouseEvent<HTMLDivElement>, item: Transaction, groupId?: string) {
+    event.preventDefault();
+    menuOrigin.current = event.currentTarget.querySelector<HTMLButtonElement>(".detail-select");
+    const bounds = event.currentTarget.getBoundingClientRect();
+    setContextMenu({ id: item.id, groupId, x: event.clientX || bounds.left + 20, y: event.clientY || bounds.top + 20, showGroups: false });
+  }
+  const rowProps = { selected, movingIds, onToggle: toggle, onEdit, onAssign, onPointerStart: pointerStart, onPointerMove: pointerMove, onPointerFinish: pointerFinish, onContextMenu: openContextMenu };
 
-  return <div className="details-page">
-    {draggedCount > 0 && <div className="drag-status" role="status">正在拖动 {draggedCount} 条账单 · 松开到分组中</div>}
-    <div className="view-heading"><div><span className="eyebrow">账单整理</span><h1>账单明细</h1><p>向上查看更新的月份，向下查看更早的月份；每月栏目独立。</p></div><button className="secondary" onClick={onAdd}>补记一笔</button></div>
-    <section className="panel filter-panel">
-      <div className="organize-period"><label>查看范围 <select aria-label="查看月份范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="range">月份范围</option></select></label>{scope === "range" && <><label>从 <input type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label></>}{!validRange && <span role="alert">请选择有效的月份范围</span>}</div>
-      <div className="filters"><input type="search" placeholder="搜索商品、商家、来源或分组" value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div>
-      <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span><button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button></div>
-    </section>
-    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong>净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button disabled={!canExclude} onClick={() => onCounted(selectedItems.map((item) => item.id), false)}>设为不计入</button><button disabled={!canRestore} onClick={() => onCounted(selectedItems.map((item) => item.id), true)}>恢复计入</button><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selected.size} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
-    <section className="purpose-groups" aria-label="用途分组">
-      <div className="group-section-heading"><h2>用途分组</h2><span>每月独立，拖入同月账单整理</span></div>
-      <form className="group-create" onSubmit={saveGroup}>{scope !== "month" && !editingGroup && <label>新建月份 <input aria-label="分组所属月份" type="month" min={scope === "range" ? start : undefined} max={scope === "range" ? end : undefined} value={groupMonth || month} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "新建分组"}</button>{editingGroup && <button type="button" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button>}</form>
-      {groupError && <p className="import-error" role="alert">{groupError}</p>}
+  return <div className={`details-page${dragged ? " is-dragging" : ""}`}>
+    {contextMenu && contextItem && <div ref={menu} className="bill-context-menu" role="menu" tabIndex={-1} aria-label="账单操作" style={{ left: contextMenu.x, top: contextMenu.y }} onContextMenu={(event) => event.preventDefault()} onKeyDown={(event) => {
+      const buttons = [...(menu.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+        buttons[next]?.focus();
+      } else if (event.key === "Tab") setContextMenu(null);
+    }}>
+      <div className="context-title">{displayTransaction(contextItem).title}</div>
+      {contextMenu.showGroups ? <><button role="menuitem" onClick={() => setContextMenu({ ...contextMenu, showGroups: false })}>‹ 返回</button>{groups.filter((group) => group.month === contextItem.date.slice(0, 7)).map((group) => <button role="menuitem" key={group.id} onClick={() => { onAssign([contextItem.id], group.id); setContextMenu(null); }}>{group.name}</button>)}</> : <>
+        <button role="menuitem" onClick={() => { toggle(contextItem.id); setContextMenu(null); }}>{selected.has(contextItem.id) ? "取消勾选" : "勾选这笔"}</button>
+        <button role="menuitem" onClick={() => { onEdit(contextItem); setContextMenu(null); }}>编辑账单</button>
+        <button role="menuitem" disabled={!counts(contextItem) && (contextItem.kind === "repayment" || contextItem.kind === "transfer")} onClick={() => { onCounted([contextItem.id], !counts(contextItem)); setContextMenu(null); }}>{counts(contextItem) ? "设为不计入" : "恢复计入"}</button>
+        <button role="menuitem" aria-haspopup="menu" disabled={!groups.some((group) => group.month === contextItem.date.slice(0, 7))} onClick={() => setContextMenu({ ...contextMenu, showGroups: true })}>移入分组 ›</button>
+        {contextMenu.groupId && <button role="menuitem" onClick={() => { onAssign([contextItem.id], contextMenu.groupId!, true); setContextMenu(null); }}>移出当前分组</button>}
+      </>}
+    </div>}
+    {dragged && <div ref={dragPreview} className="drag-preview" role="status"><strong>正在移动 {dragged.ids.length} 条账单</strong><span>{dragged.title}{dragged.ids.length > 1 ? ` 等 ${dragged.ids.length} 条` : ""}</span><small>{dropTarget ? `松开移入「${dropTarget.name}」` : "拖入同月分组，松开完成移动"}</small></div>}
+    <section className="detail-toolbar" aria-label="明细功能栏" ref={toolbar}>
+      <div className="detail-tools"><h1>明细</h1><button className="primary create-group-button" aria-expanded={toolPanel === "group"} aria-controls="detail-group-options" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupMonth(""); setGroupError(""); setToolPanel(toolPanel === "group" ? null : "group"); }}><span aria-hidden="true">＋</span>新建分组</button><select aria-label="查看月份范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="range">月份范围</option></select><input type="search" aria-label="搜索账单" placeholder="搜索商品、商家、来源或分组" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="secondary" aria-expanded={toolPanel === "filters"} aria-controls="detail-filter-options" onClick={() => setToolPanel(toolPanel === "filters" ? null : "filters")}>筛选{filterCount ? ` (${filterCount})` : ""}</button><button className="secondary" onClick={onAdd}>补记一笔</button></div>
+      {scope === "range" && <div className="organize-period"><label>从 <input aria-label="查看起始月份" type="month" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input aria-label="查看结束月份" type="month" value={end} onChange={(event) => setEnd(event.target.value)} /></label>{!validRange && <span role="alert">请选择有效的月份范围</span>}</div>}
+      <div id="detail-filter-options" className="tool-options" hidden={toolPanel !== "filters"}><div className="filters"><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div></div>
+      <div id="detail-group-options" className="tool-options" hidden={toolPanel !== "group"}><form className="group-create" onSubmit={saveGroup}>{scope !== "month" && !editingGroup && <label>所属月份 <input aria-label="分组所属月份" type="month" min={scope === "range" ? start : undefined} max={scope === "range" ? end : undefined} value={groupMonth || month} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="分组名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : "创建分组"}</button><button type="button" onClick={() => { setToolPanel(null); setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button><span className="group-hint">每月独立，拖入同月账单整理</span></form>{groupError && <p className="import-error" role="alert">{groupError}</p>}</div>
+      <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span>{(query || filterCount > 0) && <button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button>}</div>
+    <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong title="退款扣除，还款、转账及不计入记录按 0 元计算">净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，还款、转账及“不计入”记录按 0 元计算</small></div><div><select aria-label="将已选账单移入分组" value="" disabled={!selectedItems.length || !visibleGroups.length} onChange={(event) => onAssign(selectedItems.map((item) => item.id), event.target.value)}><option value="">移入分组…</option>{visibleGroups.map((group) => <option value={group.id} key={group.id}>{scope === "month" ? group.name : `${group.month} · ${group.name}`}</option>)}</select><button disabled={!canExclude} onClick={() => onCounted(selectedItems.map((item) => item.id), false)}>设为不计入</button><button disabled={!canRestore} onClick={() => onCounted(selectedItems.map((item) => item.id), true)}>恢复计入</button><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selectedItems.length} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
     </section>
     <div className="bill-timeline" ref={timeline}>{timelineMonths.map((timelineMonth) => {
       const monthly = visible.filter((item) => item.date.startsWith(timelineMonth));
@@ -454,9 +533,9 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
         const excludedCount = records.filter((item) => !counts(item)).length;
         const total = netExpense(items.filter((item) => item.groupIds?.includes(group.id)));
         return <section key={group.id} data-group-id={group.id} className={`panel purpose-folder${dragOver === group.id ? " drag-over" : ""}`} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDragOver(group.id); } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragOver(null); }} onDrop={(event) => drop(event, group.id)}>
-          <div className="folder-heading"><button className="folder-toggle" aria-expanded={expanded.has(group.id)} onClick={() => toggleGroup(group.id)}><span aria-hidden="true">{expanded.has(group.id) ? "▾" : "▸"} ▰</span><strong>{group.name}</strong><span>{records.length} 笔</span><b>¥{yuan(netExpense(records))}</b></button><div className="folder-actions"><button onClick={() => setSelected((old) => new Set([...old, ...records.map((item) => item.id)]))} disabled={!records.length}>勾选组内</button><button onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); }}>改名</button><button onClick={() => onGroupDelete(group.id)}>删除分组</button></div></div>
-          <div className="folder-caption">本月分组累计 ¥{yuan(total)}{excludedCount ? ` · ${excludedCount} 条不计入` : ""}</div>
-          {expanded.has(group.id) && <div className="folder-records">{records.length ? <BillRows records={records} groupId={group.id} {...rowProps} /> : <p className="small-empty">当前范围没有账单，可以拖入账单到这个分组。</p>}</div>}
+          <div className="folder-heading"><button className="folder-toggle" aria-expanded={expanded.has(group.id)} onClick={() => toggleGroup(group.id)}><span aria-hidden="true">{expanded.has(group.id) ? "▾" : "▸"} ▰</span><strong>{group.name}</strong><span>{records.length} 笔</span><b>¥{yuan(netExpense(records))}</b></button><div className="folder-actions"><button onClick={() => setSelected((old) => new Set([...old, ...records.map((item) => item.id)]))} disabled={!records.length}>勾选组内</button><button onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); setToolPanel("group"); if (window.innerWidth <= 980) toolbar.current?.scrollIntoView({ block: "start" }); }}>改名</button><button onClick={() => onGroupDelete(group.id)}>删除分组</button></div></div>
+          <div className="folder-caption">本月分组累计 ¥{yuan(total)}{excludedCount ? ` · ${excludedCount} 条不计入` : ""}{!records.length ? " · 可拖入同月账单" : ""}</div>
+          {expanded.has(group.id) && records.length > 0 && <div className="folder-records"><BillRows records={records} groupId={group.id} {...rowProps} /></div>}
         </section>;
       })}</div>
     <section className="panel day-list"><div className="ungrouped-heading"><h2>未分组账单</h2><span>{ungrouped.length} 笔 · 净消费 ¥{yuan(netExpense(ungrouped))}</span></div>{ungrouped.length ? <BillRows records={ungrouped} {...rowProps} /> : <p className="small-empty">当前范围没有未分组账单</p>}</section>
@@ -465,11 +544,13 @@ function Details({ items, groups, month, onMonthVisible, initialFilter, onEdit, 
   </div>;
 }
 type BillRowActions = {
+  movingIds: Set<string>;
   onToggle: (id: string) => void; onEdit: (item: Transaction) => void;
   onAssign: (ids: string[], groupId: string, remove?: boolean) => void;
   onPointerStart: (event: PointerEvent<HTMLButtonElement>, item: Transaction) => void;
   onPointerMove: (event: PointerEvent<HTMLButtonElement>) => void;
   onPointerFinish: (event: PointerEvent<HTMLButtonElement>, cancelled?: boolean) => boolean;
+  onContextMenu: (event: MouseEvent<HTMLDivElement>, item: Transaction, groupId?: string) => void;
 };
 
 function BillRows({ records, groupId, selected, ...actions }: BillRowActions & {
@@ -482,13 +563,13 @@ function BillRows({ records, groupId, selected, ...actions }: BillRowActions & {
 
 }
 
-function BillRow({ item, groupId, selected, onToggle, onEdit, onAssign, onPointerStart, onPointerMove, onPointerFinish }: BillRowActions & {
+function BillRow({ item, groupId, selected, movingIds, onToggle, onEdit, onAssign, onPointerStart, onPointerMove, onPointerFinish, onContextMenu }: BillRowActions & {
   item: Transaction; groupId?: string; selected: boolean;
 }) {
   const display = displayTransaction(item);
   const sources = transactionSources(item).join(" · ");
   const suppressClick = useRef(false);
-  return <div className={`detail-row${selected ? " is-selected" : ""}${!counts(item) ? " is-excluded" : ""}`}>
+  return <div className={`detail-row${selected ? " is-selected" : ""}${!counts(item) ? " is-excluded" : ""}${movingIds.has(item.id) ? " is-moving" : ""}`} onContextMenu={(event) => onContextMenu(event, item, groupId)}>
     <button type="button" className="detail-select" aria-pressed={selected} aria-label={`${selected ? "取消勾选" : "勾选"} ${display.title}`} onClick={(event) => {
       if (!suppressClick.current || event.detail === 0) onToggle(item.id);
       suppressClick.current = false;
