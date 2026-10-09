@@ -1,5 +1,5 @@
 export type Kind = "expense" | "refund" | "income" | "repayment" | "transfer";
-export type RelationKind = "followup" | "attachment";
+export type RelationKind = "followup" | "attachment" | "monthly";
 export type PurposeGroup = { id: string; name: string; month: string };
 
 export type Transaction = {
@@ -108,6 +108,17 @@ export function relatedTransactions(index: ReturnType<typeof relationIndex>, id:
   return found;
 }
 
+export function monthlyPaymentSummary(index: ReturnType<typeof relationIndex>, id: string) {
+  const bill = index.byId.get(id);
+  const entries = new Map<string, Transaction>();
+  for (const child of index.children.get(id) ?? []) if (child.relation === "monthly") {
+    for (const row of relatedTransactions(index, child.id)) entries.set(row.id, row);
+  }
+  const records = [...entries.values()];
+  const total = netExpense(records);
+  return { records, total, difference: (bill?.amount ?? 0) - total };
+}
+
 function validateRelations(items: Transaction[]) {
   const byId = new Map(items.map((item) => [item.id, item]));
   const complete = new Set<string>();
@@ -125,11 +136,17 @@ function validateRelations(items: Transaction[]) {
 
 export function linkTransactions(items: Transaction[], ids: string[], parentId: string, relation: RelationKind) {
   if (!items.some((item) => item.id === parentId)) throw new Error("主账单不存在");
-  if (relation !== "followup" && relation !== "attachment") throw new Error("关联类型无效");
+  if (relation !== "followup" && relation !== "attachment" && relation !== "monthly") throw new Error("关联类型无效");
   const selected = new Set(ids);
   if (!selected.size || ids.some((id) => !items.some((item) => item.id === id))) throw new Error("请选择有效的关联账单");
   if (selected.has(parentId)) throw new Error("主账单不能同时被选为它的关联记录");
-  const result = items.map((item) => selected.has(item.id) ? { ...item, parentId, relation } : item);
+  if (relation === "monthly") {
+    const parent = items.find((item) => item.id === parentId)!;
+    if (parent.kind === "income" || parent.kind === "refund" || parent.relation === "monthly") throw new Error("请选择月付还款账单作为主账单");
+    if (items.some((item) => selected.has(item.id) && item.kind !== "expense" && item.kind !== "refund")) throw new Error("月付明细只能包含消费或退款，请选择对应记录");
+    if (items.some((item) => selected.has(item.id) && items.some((child) => child.parentId === item.id && child.relation === "monthly"))) throw new Error("月付账单不能作为另一张月付账单的消费明细");
+  }
+  const result = items.map((item) => selected.has(item.id) ? { ...item, parentId, relation, ...(relation === "monthly" ? { counted: true } : {}) } : relation === "monthly" && item.id === parentId ? { ...item, counted: false } : item);
   validateRelations(result);
   return result;
 }
@@ -163,7 +180,7 @@ function record(value: unknown): Transaction | null {
   if (item.counted !== undefined && typeof item.counted !== "boolean") return null;
   if (item.tags !== undefined && (!Array.isArray(item.tags) || item.tags.some((tag) => typeof tag !== "string"))) return null;
   if (item.groupIds !== undefined && (!Array.isArray(item.groupIds) || item.groupIds.some((id) => typeof id !== "string" || !id.trim()))) return null;
-  if (item.parentId !== undefined && (typeof item.parentId !== "string" || !item.parentId.trim() || !["followup", "attachment"].includes(item.relation as string))) return null;
+  if (item.parentId !== undefined && (typeof item.parentId !== "string" || !item.parentId.trim() || !["followup", "attachment", "monthly"].includes(item.relation as string))) return null;
   if (item.parentId === undefined && item.relation !== undefined) return null;
   return {
     ...item,
@@ -201,7 +218,7 @@ export function assignGroup(items: Transaction[], ids: string[], groupId: string
 
 export function readBook(value: unknown, legacyMonth?: string): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
   const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 6)) throw new Error("不支持此 JSON 版本");
+  if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 7)) throw new Error("不支持此 JSON 版本");
   const rows = Array.isArray(value) ? value : document?.transactions;
   if (!Array.isArray(rows)) throw new Error("JSON 中没有 transactions 记录列表");
   const rawGroups = document?.groups ?? [];
@@ -243,5 +260,5 @@ export function planImport(existing: Transaction[], document: unknown, existingG
 }
 
 export function createBook(items: Transaction[], groups: PurposeGroup[] = []) {
-  return { version: 6, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
+  return { version: 7, exportedAt: new Date().toISOString(), groups, transactions: [...items].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)) };
 }

@@ -323,3 +323,9 @@ main { min-width:0; }
   .modal { width:100%; max-height:95vh; border-radius:21px 21px 0 0; }
 }
 @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; transition:none!important; animation:none!important; } }
+
+.monthly-manage-button[aria-pressed="true"] { background:#edf3ef; border-color:#bdcbbf; }
+.monthly-management-hint { margin:12px 0 0; font-size:0.75rem; color:var(--muted); line-height:1.6; }
+.monthly-payment-summary { display:flex; flex-wrap:wrap; gap:8px 16px; margin:8px 0; padding:12px 14px; border-radius:10px; background:#edf4f0; font-size:0.8125rem; }
+.monthly-payment-summary strong { color:var(--ink); }
+.monthly-payment-summary small { flex-basis:100%; color:var(--muted); }

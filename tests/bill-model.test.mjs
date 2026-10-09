@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assignGroup, counts, createBook, deleteTransaction, detachTransactions, displayTransaction, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
+import { assignGroup, counts, createBook, deleteTransaction, detachTransactions, displayTransaction, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, monthlyPaymentSummary, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
 
@@ -24,7 +24,7 @@ test("links cross-month refunds and attachments without changing monthly account
 test("whole and separate monthly JSON backups retain relation IDs and restore in either order", () => {
   const linked = linkTransactions([expense("ticket", "2026-09-30", { amount: 500 }), expense("refund", "2026-10-01", { kind: "refund", amount: 450 })], ["refund"], "ticket", "followup");
   const backup = JSON.parse(JSON.stringify(createBook(linked)));
-  assert.equal(backup.version, 6);
+  assert.equal(backup.version, 7);
   const whole = readBook(backup).transactions;
   assert.equal(relatedTransactions(relationIndex(whole), "ticket").length, 2);
   for (const months of [["2026-09", "2026-10"], ["2026-10", "2026-09"]]) {
@@ -250,4 +250,57 @@ test("imported monthly repayment can be restored, edited and backed up without c
   assert.equal(planImport(restored, createBook([raw])).added.length, 0);
   assert.equal(netExpense(setCounted(restored, [raw.id], false)), 0);
   assert.equal(counts({ ...raw, counted: undefined }), false);
+});
+
+
+test("monthly payments count purchases and refunds on original dates while excluding repayment", () => {
+  const rows = [expense("payment", "2026-10-10", { kind: "repayment", amount: 210, counted: true }), expense("meal", "2026-09-30", { amount: 100, counted: false, source: "美团", groupIds: ["sept"], orderId: "meal-order" }), expense("pan", "2026-09-29", { amount: 150 }), expense("refund", "2026-10-01", { kind: "refund", amount: 50, counted: false }), expense("other", "2026-09-30", { counted: false })];
+  const linked = linkTransactions(rows, ["meal", "pan", "refund"], "payment", "monthly");
+  assert.equal(linked[0].counted, false);
+  assert.equal(linked[1].counted, true);
+  assert.equal(linked[3].counted, true);
+  assert.equal(linked[4].counted, false);
+  assert.equal(netExpense(linked), 200);
+  assert.equal(netExpense(linked.filter((item) => item.date.startsWith("2026-09"))), 250);
+  assert.equal(netExpense(linked.filter((item) => item.date.startsWith("2026-10"))), -50);
+  assert.equal(linked[1].date, rows[1].date);
+  assert.equal(linked[1].orderId, "meal-order");
+  assert.deepEqual(linked[1].groupIds, ["sept"]);
+  assert.equal(rows[0].counted, true);
+  const summary = monthlyPaymentSummary(relationIndex(linked), "payment");
+  assert.equal(summary.records.length, 3);
+  assert.equal(summary.total, 200);
+  assert.equal(summary.difference, 10);
+  const detached = detachTransactions(linked, ["meal"]);
+  assert.equal(detached[1].counted, true);
+  assert.equal(monthlyPaymentSummary(relationIndex(detached), "payment").total, 100);
+});
+
+test("monthly payment backups restore in either order and preserve later inclusion edits", () => {
+  const rows = linkTransactions([expense("payment", "2026-10-10", { kind: "repayment", amount: 100 }), expense("order", "2026-09-30", { amount: 100 })], ["order"], "payment", "monthly");
+  for (const dates of [["2026-09", "2026-10"], ["2026-10", "2026-09"]]) {
+    let restored = [];
+    for (const month of dates) restored.push(...planImport(restored, createBook(rows.filter((item) => item.date.startsWith(month)))).added);
+    assert.equal(netExpense(restored), 100);
+    assert.equal(monthlyPaymentSummary(relationIndex(restored), "payment").difference, 0);
+  }
+  const local = setCounted(rows, ["order"], false);
+  const imported = planImport(local, createBook(rows));
+  assert.equal(imported.duplicates, 2);
+  assert.equal(imported.added.length, 0);
+  assert.equal(netExpense(local), 0);
+  assert.equal(readBook({ version: 6, transactions: [expense("old", "2026-09-30")] }).transactions.length, 1);
+});
+
+test("monthly payment summary includes refund followups once and validates payment roles", () => {
+  const original = [expense("payment", "2026-10-10", { kind: "repayment", amount: 100 }), expense("buy", "2026-09-30", { amount: 100 }), expense("refund", "2026-10-01", { kind: "refund", amount: 20 })];
+  const linked = linkTransactions(linkTransactions(original, ["refund"], "buy", "followup"), ["buy"], "payment", "monthly");
+  assert.equal(monthlyPaymentSummary(relationIndex(linked), "payment").total, 80);
+  const regrouped = linkTransactions(linked, ["refund"], "payment", "monthly");
+  assert.equal(monthlyPaymentSummary(relationIndex(regrouped), "payment").total, 80);
+  assert.equal(monthlyPaymentSummary(relationIndex(regrouped), "payment").records.length, 2);
+  assert.throws(() => linkTransactions(original, ["payment"], "buy", "monthly"), /消费或退款/);
+  assert.throws(() => linkTransactions(original, ["buy"], "refund", "monthly"), /主账单/);
+  assert.throws(() => linkTransactions(regrouped, ["buy"], "refund", "monthly"), /主账单/);
+  assert.throws(() => linkTransactions(regrouped, ["payment"], "buy", "monthly"), /主账单/);
 });
