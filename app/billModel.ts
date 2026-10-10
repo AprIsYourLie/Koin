@@ -243,6 +243,37 @@ export function assignGroup(items: Transaction[], ids: string[], groupId: string
   return items.map((item) => selected.has(item.id) && (remove || !month || item.date.startsWith(month)) ? { ...item, groupIds: remove ? (item.groupIds ?? []).filter((id) => id !== groupId) : [groupId] } : item);
 }
 
+export function convertGroupTags<T extends { transactions: Transaction[]; groups: PurposeGroup[] }>(book: T, existingThemes: PurposeGroup[] = []): T {
+  const names = new Map(mergeGroups(existingThemes, book.groups).map((theme) => [theme.id, theme.name]));
+  return { ...book, transactions: book.transactions.map((item) => ({ ...item, tags: [...new Set([...(item.tags ?? []), ...(item.groupIds ?? []).flatMap((id) => names.has(id) ? [names.get(id)!] : [])])], groupIds: [] })) };
+}
+
+export function setTags(items: Transaction[], ids: string[], tag: string, remove = false, month?: string) {
+  const selected = new Set(ids);
+  const name = tag.trim();
+  if (!name) return items;
+  return items.map((item) => selected.has(item.id) && (!month || item.date.startsWith(month)) ? { ...item, tags: remove ? (item.tags ?? []).filter((value) => value !== name) : [...new Set([...(item.tags ?? []), name])] } : item);
+}
+
+export function renameMonthlyTag(items: Transaction[], name: string, next: string, month: string) {
+  return items.map((item) => item.date.startsWith(month) && item.tags?.includes(name) ? { ...item, tags: [...new Set(item.tags.map((tag) => tag === name ? next : tag))] } : item);
+}
+
+export function filterTransactions(items: Transaction[], filter: { start?: string; end?: string; query?: string; category?: string; merchant?: string; tag?: string; source?: string }) {
+  const query = filter.query?.trim().toLowerCase();
+  return items.filter((item) => {
+    if ((filter.start && item.date < filter.start) || (filter.end && item.date > filter.end)) return false;
+    if ((filter.category && item.category !== filter.category) || (filter.merchant && item.merchant !== filter.merchant) || (filter.tag && !item.tags?.includes(filter.tag))) return false;
+    const sources = transactionSources(item);
+    return (!filter.source || sources.includes(filter.source)) && (!query || [item.merchant, item.note, item.category, item.orderId, ...sources, ...(item.tags ?? [])].join(" ").toLowerCase().includes(query));
+  });
+}
+
+export function closestLedgerDate(dates: string[], target: string) {
+  const sorted = [...new Set(dates)].sort().reverse();
+  return sorted.find((date) => date <= target) ?? sorted.at(-1);
+}
+
 export function readBook(value: unknown, legacyMonth?: string): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
   const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
   if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 7)) throw new Error("不支持此 JSON 版本");

@@ -1,8 +1,62 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyMonthlyAccounting, assignGroup, contextTransactionIds, counts, createBook, deleteTransaction, detachTransactions, displayTransaction, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, monthlyPaymentSummary, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
+import { closestLedgerDate, convertGroupTags, filterTransactions, renameMonthlyTag, setTags } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
+
+test("legacy folders become additive tags without moving records or changing counting and relations", () => {
+  const groups = [{ id: "sept", name: "厨具购买", month: "2026-09" }, { id: "oct", name: "厨具购买", month: "2026-10" }, { id: "empty", name: "旅行", month: "2026-09" }];
+  const rows = [expense("pan", "2026-09-30", { amount: 100, groupIds: ["sept"], tags: ["厨具购买", "购物"] }), expense("refund", "2026-10-01", { kind: "refund", amount: 20, groupIds: ["oct"], parentId: "pan", relation: "followup" }), expense("excluded", "2026-09-29", { counted: false, groupIds: ["sept"] })];
+  const migrated = convertGroupTags(readBook(createBook(rows, groups)));
+  assert.equal(netExpense(migrated.transactions), 80);
+  assert.deepEqual(migrated.transactions.map((row) => row.id).sort(), rows.map((row) => row.id).sort());
+  const pan = migrated.transactions.find((row) => row.id === "pan");
+  assert.deepEqual(pan.tags, ["厨具购买", "购物"]);
+  assert.deepEqual(pan.groupIds, []);
+  assert.equal(migrated.transactions.find((row) => row.id === "refund").parentId, "pan");
+  assert.equal(migrated.groups.length, 3);
+  const backup = convertGroupTags(readBook(JSON.parse(JSON.stringify(createBook(migrated.transactions, migrated.groups)))));
+  assert.deepEqual(backup.transactions, migrated.transactions);
+  assert.equal(planImport(migrated.transactions, createBook(migrated.transactions, groups), groups).added.length, 0);
+  const localName = convertGroupTags(readBook(createBook(rows, groups)), [{ ...groups[0], name: "锅具" }]);
+  assert.ok(localName.transactions.find((row) => row.id === "excluded").tags.includes("锅具"));
+  assert.deepEqual(rows[0].groupIds, ["sept"]);
+});
+
+test("tag edits preserve other tags and isolate monthly theme rename and removal", () => {
+  const rows = [expense("sept", "2026-09-30"), expense("refund", "2026-09-30", { amount: 8, kind: "refund" }), expense("oct", "2026-10-01")];
+  const marked = setTags(rows, rows.map((row) => row.id), "厨具");
+  const twice = setTags(marked, ["sept"], "厨具");
+  assert.deepEqual(twice[0].tags, ["外卖", "厨具"]);
+  const renamed = renameMonthlyTag(marked, "厨具", "锅具", "2026-09");
+  assert.deepEqual(renamed[2].tags, ["外卖", "厨具"]);
+  const removed = setTags(renamed, renamed.map((row) => row.id), "锅具", true, "2026-09");
+  assert.deepEqual(removed[0].tags, ["外卖"]);
+  assert.deepEqual(removed[2].tags, marked[2].tags);
+  assert.equal(netExpense(removed), netExpense(rows));
+  assert.deepEqual(rows[0].tags, ["外卖"]);
+});
+
+test("daily ranges and confirmed search combine tags, sources, refunds and excluded records", () => {
+  const rows = [expense("before", "2026-09-29"), expense("pan", "2026-09-30", { amount: 100, note: "炒锅", tags: ["厨具"], source: "支付宝" }), expense("refund", "2026-10-01", { kind: "refund", amount: 20, tags: ["厨具"], source: "支付宝" }), expense("excluded", "2026-10-01", { counted: false, tags: ["厨具"], source: "支付宝" }), expense("after", "2026-10-02")];
+  const range = filterTransactions(rows, { start: "2026-09-30", end: "2026-10-01", tag: "厨具", source: "支付宝" });
+  assert.deepEqual(range.map((row) => row.id), ["pan", "refund", "excluded"]);
+  assert.equal(netExpense(range), 80);
+  assert.deepEqual(filterTransactions(rows, { start: "2026-09-30", end: "2026-09-30" }).map((row) => row.id), ["pan"]);
+  assert.deepEqual(filterTransactions(rows, { query: " 炒锅 " }).map((row) => row.id), ["pan"]);
+  assert.deepEqual(filterTransactions(rows, { start: "2026-10-01", end: "2026-09-30" }), []);
+  assert.deepEqual(filterTransactions(rows, { query: "不存在" }), []);
+});
+
+test("date jump locates a billed day or nearest earlier day and handles empty or bounded timelines", () => {
+  const dates = ["2026-10-02", "2026-09-30", "2026-10-02", "2026-09-28"];
+  assert.equal(closestLedgerDate(dates, "2026-09-30"), "2026-09-30");
+  assert.equal(closestLedgerDate(dates, "2026-10-01"), "2026-09-30");
+  assert.equal(closestLedgerDate(dates, "2026-12-31"), "2026-10-02");
+  assert.equal(closestLedgerDate(dates, "2026-08-01"), "2026-09-28");
+  assert.equal(closestLedgerDate([], "2026-10-01"), undefined);
+});
 
 test("links cross-month refunds and attachments without changing monthly accounting or metadata", () => {
   const rows = [expense("ticket", "2026-09-30", { amount: 500, source: "支付宝", groupIds: ["sept"] }), expense("refund", "2026-10-01", { amount: 450, kind: "refund", source: "微信", groupIds: ["oct"] }), expense("fee", "2026-10-01", { amount: 20 }), expense("ignored", "2026-10-02", { counted: false })];
