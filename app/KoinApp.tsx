@@ -293,6 +293,12 @@ function BillSearch({ query, onSearch }: { query: string; onSearch: (query: stri
   return <form className="bill-search" role="search" onSubmit={(event) => { event.preventDefault(); onSearch(draft.trim()); }}><input type="search" aria-label="搜索账单" placeholder="搜索商品、商家、来源或标签 · 回车确认" value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="secondary" type="submit">搜索</button></form>;
 }
 
+function ledgerHeaderOffset(target: HTMLElement, includeDay = false) {
+  const monthHeader = target.closest(".month-ledger")?.querySelector(".month-heading");
+  const dayHeader = includeDay ? target.closest(".day-group")?.querySelector(".day-heading") : null;
+  return (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + (monthHeader?.getBoundingClientRect().height ?? 44) + (dayHeader?.getBoundingClientRect().height ?? 0) + 8;
+}
+
 function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFilter, onEdit, onAdd, onCounted, onLink, onDetach, onGroupSave, onGroupDelete, onTag }: {
   monthlyMode: MonthlyAccounting; items: Transaction[]; groups: PurposeGroup[]; month: string; initialFilter: DetailFilter;
   onMonthVisible: (month: string) => void;
@@ -332,7 +338,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const [groupMonth, setGroupMonth] = useState("");
   const [editingGroup, setEditingGroup] = useState<string | null>(null);
   const [groupError, setGroupError] = useState("");
-  const [toolPanel, setToolPanel] = useState<"filters" | "group" | null>(() => Object.values(initialFilter).some(Boolean) ? "filters" : null);
+  const [toolPanel, setToolPanel] = useState<"filters" | "group" | "manage" | null>(() => Object.values(initialFilter).some(Boolean) ? "filters" : null);
   const [contextMenu, setContextMenu] = useState<{ id: string; x: number; y: number; showGroups: boolean } | null>(null);
   const menu = useRef<HTMLDivElement>(null);
   const menuOrigin = useRef<HTMLButtonElement | null>(null);
@@ -342,7 +348,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const dragPreview = useRef<HTMLDivElement>(null);
   const pointerDrag = useRef<{ ids: string[]; title: string; pointerId: number; x: number; y: number; currentX: number; currentY: number; moved: boolean } | null>(null);
   const timeline = useRef<HTMLDivElement>(null);
-  const toolbar = useRef<HTMLElement>(null);
+  const themeStrip = useRef<HTMLDivElement>(null);
   const visibleMonth = useRef<string | null>(null);
   const userScrolling = useRef(false);
   const validRange = scope === "range" ? Boolean(start && end && start <= end) : scope !== "day" || Boolean(day);
@@ -378,13 +384,24 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const dropTarget = dragOver;
   const dropRecord = relations.byId.get(dropRecordId ?? "");
 
+  useLayoutEffect(() => {
+    const strip = themeStrip.current;
+    if (strip && !tag) { strip.scrollLeft = 0; return; }
+    const button = [...(strip?.querySelectorAll<HTMLElement>("[data-tag-name]") ?? [])].find((item) => item.dataset.tagName === tag);
+    if (!strip || !button) return;
+    const bounds = strip.getBoundingClientRect();
+    const rect = button.getBoundingClientRect();
+    const delta = rect.left < bounds.left ? rect.left - bounds.left : rect.right > bounds.right ? rect.right - bounds.right : 0;
+    if (delta) strip.scrollLeft += delta;
+  }, [tag, tags]);
+
   useEffect(() => {
     if (!revealId) return;
     const item = relations.byId.get(revealId);
     const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-record-id]") ?? [])].find((row) => row.dataset.recordId === revealId && row.closest<HTMLElement>("[data-month]")?.dataset.month === item?.date.slice(0, 7));
     if (!target) return;
     userScrolling.current = false;
-    const offset = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + (window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0) + 20;
+    const offset = ledgerHeaderOffset(target, true);
     window.scrollTo({ top: Math.max(0, scrollY + target.getBoundingClientRect().top - offset), behavior: "auto" });
     target.querySelector<HTMLButtonElement>(".detail-select")?.focus({ preventScroll: true });
     setRevealId(null);
@@ -442,13 +459,16 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     };
   }, [contextMenu]);
 
-  useEffect(() => {
-    const element = toolbar.current;
-    if (!element) return;
-    const observer = new ResizeObserver(() => document.documentElement.style.setProperty("--detail-toolbar-height", `${element.getBoundingClientRect().height}px`));
-    observer.observe(element);
+  useLayoutEffect(() => {
+    const observer = new ResizeObserver((entries) => {
+      for (const { target } of entries) {
+        const ledger = target.closest<HTMLElement>(".month-ledger");
+        ledger?.style.setProperty("--ledger-month-height", `${target.getBoundingClientRect().height}px`);
+      }
+    });
+    for (const header of timeline.current?.querySelectorAll(".month-heading") ?? []) observer.observe(header);
     return () => observer.disconnect();
-  }, []);
+  }, [timelineMonths]);
 
   useEffect(() => {
     if (revealId || jumpDate) { visibleMonth.current = month; return; }
@@ -458,8 +478,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     userScrolling.current = false;
     if (firstVisit && month === firstTimelineMonth) return;
     const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-month]") ?? [])].find((section) => section.dataset.month === month);
-    const toolbarHeight = window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0;
-    if (target) window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) - toolbarHeight - 20), behavior: "auto" });
+    if (target) window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) - 8), behavior: "auto" });
   }, [month, scope, firstTimelineMonth, revealId, jumpDate]);
 
   useEffect(() => {
@@ -468,7 +487,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     const located = closestLedgerDate(visible.map((item) => item.date), jumpDate);
     const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-date]") ?? [])].find((row) => row.dataset.date === located);
     if (target && located) {
-      const offset = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + (window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0) + 18;
+      const offset = ledgerHeaderOffset(target);
       visibleMonth.current = located.slice(0, 7);
       onMonthVisible(located.slice(0, 7));
       window.scrollTo({ top: Math.max(0, window.scrollY + target.getBoundingClientRect().top - offset), behavior: "auto" });
@@ -484,11 +503,12 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     let frame = 0;
     function updateDate() {
       frame = 0;
-      const toolbarHeight = window.innerWidth > 980 ? toolbar.current?.getBoundingClientRect().height ?? 0 : 0;
-      const marker = (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + toolbarHeight + 24;
+      const topbarHeight = document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84;
       const sections = timeline.current?.querySelectorAll<HTMLElement>("[data-date]") ?? [];
       for (const section of sections) {
         const rect = section.getBoundingClientRect();
+        if (rect.bottom <= topbarHeight) continue;
+        const marker = ledgerHeaderOffset(section, true);
         if (rect.bottom > marker && section.dataset.date) {
           setActiveDate(section.dataset.date);
           const currentMonth = section.dataset.date.slice(0, 7);
@@ -542,6 +562,16 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     if (editingGroup && tag === groups.find((group) => group.id === editingGroup)?.name) setTag(name);
     setEditingGroup(null); setGroupName(""); setGroupError("");
     setToolPanel(null);
+  }
+  function batchAction(action: string) {
+    const ids = selectedItems.map((item) => item.id);
+    if (!ids.length) return;
+    if (action.startsWith("tag:")) onTag(ids, action.slice(4));
+    else if (action === "remove-tag" && tag) onTag(ids, tag, true);
+    else if (action === "exclude") onCounted(ids, false);
+    else if (action === "restore") onCounted(ids, true);
+    else if (action === "monthly") setLinkRequest({ ids, parentId: "", relation: "monthly" });
+    else if (action === "clear") setSelected(new Set());
   }
   function drop(event: DragEvent, name: string) {
     event.preventDefault(); setDragOver(null);
@@ -620,33 +650,45 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     </div>}
     {linkRequest && <LinkDialog monthlyMode={monthlyMode} items={items} request={linkRequest} onClose={() => setLinkRequest(null)} onLink={(parentId, relation) => { onLink(linkRequest.ids, parentId, relation); setExpandedRelations((old) => new Set([...old, parentId])); setLinkRequest(null); }} />}
     {dragged && <div ref={dragPreview} className="drag-preview" role="status"><strong>正在移动 {dragged.ids.length} 条账单</strong><span>{dragged.title}{dragged.ids.length > 1 ? ` 等 ${dragged.ids.length} 条` : ""}</span><small>{dropRecord ? `松开关联到「${displayTransaction(dropRecord).title}」` : dropTarget ? `松开添加「${dropTarget}」标签` : "拖到标签主题添加标签，或拖到另一笔账单建立关联"}</small>{activeDate && <small>当前位置 {activeDate}</small>}</div>}
-    <section className="detail-toolbar" aria-label="明细功能栏" ref={toolbar}>
+    <section className="detail-toolbar" aria-label="明细功能栏">
       <div className="detail-tools">
         <h1>明细</h1>
-        <button className="primary create-group-button" aria-expanded={toolPanel === "group"} aria-controls="detail-group-options" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupMonth(""); setGroupError(""); setToolPanel(toolPanel === "group" ? null : "group"); }}>＋ 新建标签</button>
-        <button className="secondary monthly-manage-button" aria-pressed={monthlyOnly} onClick={() => { setMonthlyOnly(!monthlyOnly); if (!monthlyOnly) setExpandedRelations((old) => new Set([...old, ...monthlyRoots])); }}>月付管理</button>
-        <select aria-label="查看日期范围" value={scope} onChange={(event) => { setScope(event.target.value as typeof scope); setDateMessage(""); }}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="day">指定日期</option><option value="range">日期范围</option></select>
         <BillSearch query={query} onSearch={setQuery} />
-        <button className="secondary" aria-expanded={toolPanel === "filters"} aria-controls="detail-filter-options" onClick={() => setToolPanel(toolPanel === "filters" ? null : "filters")}>筛选{filterCount ? " (" + filterCount + ")" : ""}</button><button className="secondary" onClick={onAdd}>补记一笔</button>
-      </div>
-      <div className="date-tools">
-        {scope === "range" ? <><label>从 <input aria-label="查看起始日期" type="date" value={start} onInput={(event) => setStart(event.currentTarget.value)} onChange={(event) => setStart(event.target.value)} /></label><label>到 <input aria-label="查看结束日期" type="date" value={end} onInput={(event) => setEnd(event.currentTarget.value)} onChange={(event) => setEnd(event.target.value)} /></label></> : <label>{scope === "day" ? "查看日期" : "定位日期"}<input aria-label={scope === "day" ? "查看日期" : "定位日期"} type="date" value={day} onInput={(event) => { setDay(event.currentTarget.value); setDateMessage(""); }} onChange={(event) => { setDay(event.target.value); setDateMessage(""); }} /></label>}
-        {scope !== "day" && scope !== "range" && <button className="secondary" disabled={!day} onClick={() => { setScope("all"); setJumpDate(day); }}>跳转</button>}
-        {!validRange && <span role="alert">请选择有效的日期范围</span>}{dateMessage && <span role="status">{dateMessage}</span>}
-        <span className="search-pending">{query ? `搜索条件：${query}` : "搜索按回车或点击按钮确认"}</span>
+        <button className="secondary monthly-manage-button" aria-pressed={monthlyOnly} title={`月付管理：当前${MONTHLY_MODE_NAMES[monthlyMode]}，可在设置中切换。消费、退款和提前还款均可归入，保留原日期。`} onClick={() => { setMonthlyOnly(!monthlyOnly); if (!monthlyOnly) setExpandedRelations((old) => new Set([...old, ...monthlyRoots])); }}>月付管理</button>
+        <button className="secondary" aria-expanded={toolPanel === "filters"} aria-controls="detail-filter-options" onClick={() => setToolPanel(toolPanel === "filters" ? null : "filters")}>筛选{filterCount ? " (" + filterCount + ")" : ""}</button><button className="secondary" aria-label="补记一笔" onClick={onAdd}>补记</button>
       </div>
       <div id="detail-filter-options" className="tool-options" hidden={toolPanel !== "filters"}><div className="filters"><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div></div>
-      <div id="detail-group-options" className="tool-options" hidden={toolPanel !== "group"}><form className="group-create" onSubmit={saveGroup}>{!editingGroup && <label>主题月份 <input aria-label="标签主题月份" type="month" value={themeMonth} onInput={(event) => setGroupMonth(event.currentTarget.value)} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<input aria-label="标签名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /><button className="secondary" type="submit">{editingGroup ? "保存名称" : selectedItems.length ? "创建并标记已选" : "创建标签"}</button><button type="button" onClick={() => { setToolPanel(null); setEditingGroup(null); setGroupName(""); setGroupError(""); }}>取消</button><span className="group-hint">账单保留在日期列表，一笔可有多个标签</span></form>{groupError && <p className="import-error" role="alert">{groupError}</p>}</div>
       <section className="tag-themes" aria-label="标签主题">
-        <div className="theme-heading"><strong>标签主题</strong><span>点击查看，拖入添加标签</span></div>
-        <div className="theme-strip"><button className="theme-chip" aria-pressed={!tag} onClick={() => setTag("")}><strong>全部账单</strong><span>{filtered.length} 条 · ¥{yuan(netExpense(filtered))}</span></button>{tagSummaries.map((theme) => <button key={theme.name} data-tag-name={theme.name} className={"theme-chip" + (dragOver === theme.name ? " drag-over" : "")} aria-pressed={tag === theme.name} onClick={() => setTag(tag === theme.name ? "" : theme.name)} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); setDragOver(theme.name); } }} onDragLeave={() => setDragOver(null)} onDrop={(event) => drop(event, theme.name)}><strong>#{theme.name}</strong><span>{theme.count} 条 · ¥{yuan(theme.total)}</span></button>)}</div>
-        {tag && <div className="active-theme"><span>正在查看 #{tag}</span><button onClick={() => setTag("")}>显示全部账单</button>{visibleGroups.filter((group) => group.name === tag).map((group) => <span className="theme-management" key={group.id}><small>{group.month}</small><button onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); setToolPanel("group"); }}>改名</button><button onClick={() => onGroupDelete(group.id)}>删除标签</button></span>)}</div>}
+        <strong className="theme-heading" title="点击筛选，拖入账单添加标签">标签</strong>
+        <div className="theme-strip" ref={themeStrip}><button className="theme-chip" aria-pressed={!tag} onClick={() => setTag("")}><strong>全部</strong><span>{filtered.length} 条 · ¥{yuan(netExpense(filtered))}</span></button>{tagSummaries.map((theme) => <button key={theme.name} data-tag-name={theme.name} title={`#${theme.name} · ${theme.count} 条 · 净消费 ¥${yuan(theme.total)}；拖入账单添加标签`} className={"theme-chip" + (dragOver === theme.name ? " drag-over" : "")} aria-pressed={tag === theme.name} onClick={() => setTag(tag === theme.name ? "" : theme.name)} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); setDragOver(theme.name); } }} onDragLeave={() => setDragOver(null)} onDrop={(event) => drop(event, theme.name)}><strong>#{theme.name}</strong><span>{theme.count} · ¥{yuan(theme.total)}</span></button>)}</div>
       </section>
-      {monthlyOnly && <p className="monthly-management-hint">月付管理 · 当前{MONTHLY_MODE_NAMES[monthlyMode]}，可在系统设置中切换。消费、退款与提前还款均可归入，原日期保留。</p>}
-      <div className="filter-summary"><span>当前显示 {visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span>{(query || filterCount > 0) && <button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button>}</div>
-      <section className="selected-summary"><div><span>已选 {selectedItems.length} 条</span><strong title="退款扣除，不计入记录按 0 元计算">净消费 ¥{yuan(netExpense(selectedItems))}</strong><small>退款扣除，不计入按 0 元；手动计入的还款、转账按支出</small></div><div><select aria-label="给已选账单添加标签" value="" disabled={!selectedItems.length || !tags.length} onChange={(event) => onTag(selectedItems.map((item) => item.id), event.target.value)}><option value="">添加标签…</option>{tags.map((name) => <option value={name} key={name}>#{name}</option>)}</select>{tag && <button disabled={!selectedItems.length} onClick={() => onTag(selectedItems.map((item) => item.id), tag, true)}>移除当前标签</button>}<button disabled={!selectedItems.length || selectedItems.some((item) => item.kind === "income")} onClick={() => setLinkRequest({ ids: selectedItems.map((item) => item.id), parentId: "", relation: "monthly" })}>归入月付…</button><button disabled={!canExclude} onClick={() => onCounted(selectedItems.map((item) => item.id), false)}>设为不计入</button><button disabled={!canRestore} onClick={() => onCounted(selectedItems.map((item) => item.id), true)}>恢复计入</button><button onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button><button disabled={!selectedItems.length} onClick={() => setSelected(new Set())}>清空勾选</button></div></section>
+      <div className="detail-utility">
+        <div className="date-tools">
+          <select aria-label="查看日期范围" value={scope} onChange={(event) => { setScope(event.target.value as typeof scope); setDateMessage(""); }}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="day">指定日期</option><option value="range">日期范围</option></select>
+          {scope === "range" ? <><input aria-label="查看起始日期" type="date" value={start} onInput={(event) => setStart(event.currentTarget.value)} onChange={(event) => setStart(event.target.value)} /><span>至</span><input aria-label="查看结束日期" type="date" value={end} onInput={(event) => setEnd(event.currentTarget.value)} onChange={(event) => setEnd(event.target.value)} /></> : <input aria-label={scope === "day" ? "查看日期" : "定位日期"} title={scope === "day" ? "查看指定日期" : "选择要定位的日期"} type="date" value={day} onInput={(event) => { setDay(event.currentTarget.value); setDateMessage(""); }} onChange={(event) => { setDay(event.target.value); setDateMessage(""); }} />}
+          {scope !== "day" && scope !== "range" && <button className="secondary" disabled={!day} onClick={() => { setScope("all"); setJumpDate(day); }}>定位</button>}
+        </div>
+        <div className="tag-tools">
+          <button className="secondary" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupMonth(""); setGroupError(""); setToolPanel("group"); }}>＋ 新建标签</button>
+          <button className="secondary" disabled={!tag || !visibleGroups.some((group) => group.name === tag)} onClick={() => setToolPanel("manage")}>管理标签</button>
+        </div>
+        <section className="selection-tools" aria-label="勾选与批量操作">
+          <div className="selection-total" title="退款扣除，不计入按 0 元；手动计入的还款、转账按支出"><span>已选 {selectedItems.length} 条</span><strong>¥{yuan(netExpense(selectedItems))}</strong></div>
+          <select aria-label="批量操作" value="" disabled={!selectedItems.length} onChange={(event) => batchAction(event.target.value)}>
+            <option value="">批量操作…</option>
+            <optgroup label="添加标签">{tags.map((name) => <option value={`tag:${name}`} key={name}>#{name}</option>)}</optgroup>
+            {tag && <option value="remove-tag">移除当前标签</option>}
+            <optgroup label="统计与关联"><option value="monthly" disabled={selectedItems.some((item) => item.kind === "income")}>归入月付…</option><option value="exclude" disabled={!canExclude}>设为不计入</option><option value="restore" disabled={!canRestore}>恢复计入</option></optgroup>
+            <option value="clear">清空勾选</option>
+          </select>
+          <button className="secondary" disabled={!visible.length} onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button>
+        </section>
+      </div>
+      <div className="filter-summary"><span title={query ? `搜索条件：${query}` : undefined}>{monthlyOnly ? "月付账单 · " : ""}{visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span>{(query || filterCount > 0) && <button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button>}{!validRange && <span role="alert">请选择有效的日期范围</span>}{dateMessage && <span role="status">{dateMessage}</span>}</div>
     </section>
-    {visible.length > 0 && <div className="scroll-date" aria-label="当前浏览日期"><small>当前位置</small><strong>{activeDate || visible[0].date}</strong></div>}
+    {toolPanel === "group" && <Modal title={editingGroup ? "标签改名" : "新建标签"} onClose={() => setToolPanel(null)}><form className="editor-form" onSubmit={saveGroup}>{!editingGroup && <label>主题月份<input aria-label="标签主题月份" type="month" value={themeMonth} onInput={(event) => setGroupMonth(event.currentTarget.value)} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<label>标签名称<input aria-label="标签名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /></label><p className="group-hint">{selectedItems.length && !editingGroup ? `创建后标记已选的 ${selectedItems.length} 条账单；` : ""}账单保留在日期列表，一笔可有多个标签。</p>{groupError && <p className="import-error" role="alert">{groupError}</p>}<div className="modal-actions"><button className="secondary" type="button" onClick={() => setToolPanel(null)}>取消</button><button className="primary" type="submit">{editingGroup ? "保存名称" : selectedItems.length ? "创建并标记已选" : "创建标签"}</button></div></form></Modal>}
+    {toolPanel === "manage" && <Modal title="管理标签" onClose={() => setToolPanel(null)}><div className="theme-manager"><strong>#{tag}</strong><p className="group-hint">按月管理主题；改名或移除只影响对应月份的同名标签，账单会保留。</p>{visibleGroups.filter((group) => group.name === tag).map((group) => <div className="theme-management" key={group.id}><span>{formatMonth(group.month)}</span><button className="secondary" onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); setToolPanel("group"); }}>改名</button><button className="secondary" onClick={() => onGroupDelete(group.id)}>删除标签</button></div>)}</div></Modal>}
+    {visible.length > 0 && <span className="screen-reader-only" aria-label="当前浏览日期">{activeDate || visible[0].date}</span>}
     <div className="bill-timeline" ref={timeline}>{timelineMonths.map((timelineMonth) => {
       const monthly = visible.filter((item) => item.date.startsWith(timelineMonth));
       return <section className="month-ledger" key={timelineMonth} data-month={timelineMonth} aria-label={formatMonth(timelineMonth) + "账单"}>
