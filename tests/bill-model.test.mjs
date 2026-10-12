@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyMonthlyAccounting, assignGroup, contextTransactionIds, counts, createBook, deleteTransaction, detachTransactions, displayTransaction, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, monthlyPaymentSummary, netExpense, planImport, readBook, relatedTransactions, relationIndex, retainMonthlyGroups, setCounted, transactionSources } from "../app/billModel.ts";
-import { closestLedgerDate, convertGroupTags, filterTransactions, renameMonthlyTag, setTags } from "../app/billModel.ts";
+import { closestLedgerDate, convertGroupTags, filterTransactions, monthlyTagThemes, renameMonthlyTag, setTags } from "../app/billModel.ts";
 
 const expense = (id, date, extra = {}) => ({ id, date, merchant: "美团", amount: 28, category: "餐饮", kind: "expense", note: "晚餐", tags: ["外卖"], counted: true, ...extra });
+
+test("monthly themes isolate same-name totals, refunds, excluded records and empty themes", () => {
+  const rows = [expense("sept", "2026-09-30", { amount: 100, tags: ["厨具", "厨具"] }), expense("refund", "2026-09-30", { amount: 20, kind: "refund", tags: ["厨具"] }), expense("excluded", "2026-09-30", { counted: false, tags: ["厨具"] }), expense("oct", "2026-10-01", { amount: 50, tags: ["厨具", "旅行"] })];
+  const groups = [{ id: "empty", name: "学习", month: "2026-09" }, { id: "oct", name: "厨具", month: "2026-10" }];
+  const themes = monthlyTagThemes(rows, groups);
+  assert.deepEqual(themes.get("2026-09").find((theme) => theme.name === "厨具"), { name: "厨具", count: 3, total: 80 });
+  assert.deepEqual(themes.get("2026-10").find((theme) => theme.name === "厨具"), { name: "厨具", count: 1, total: 50 });
+  assert.deepEqual(themes.get("2026-09").find((theme) => theme.name === "学习"), { name: "学习", count: 0, total: 0 });
+  assert.ok(!themes.get("2026-09").some((theme) => theme.name === "旅行"));
+  assert.ok(!themes.get("2026-10").some((theme) => theme.name === "学习"));
+  assert.equal(netExpense(rows), 130);
+});
 
 test("legacy folders become additive tags without moving records or changing counting and relations", () => {
   const groups = [{ id: "sept", name: "厨具购买", month: "2026-09" }, { id: "oct", name: "厨具购买", month: "2026-10" }, { id: "empty", name: "旅行", month: "2026-09" }];

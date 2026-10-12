@@ -115,7 +115,10 @@ main { min-width:0; }
 .selection-total span { color:var(--muted); }
 .selection-total strong { font-size:0.8125rem; }
 .selection-tools select { width:7.75rem; }
-.tag-themes { display:flex; align-items:center; gap:10px; margin-top:10px; min-width:0; }
+.tag-themes { display:flex; align-items:center; gap:6px; padding:0 10px 5px; min-width:0; }
+.month-tag-action { flex:none; width:34px; height:34px; border:1px solid var(--line); border-radius:8px; background:#f8faf7; color:var(--accent-dark); cursor:pointer; font-size:1rem; }
+.month-tag-action:hover { background:#edf5ef; border-color:#9db7a6; }
+.month-empty { padding:18px 0; color:var(--muted); font-size:0.8125rem; }
 .theme-heading { flex:none; color:var(--muted); font-size:0.75rem; }
 .theme-strip { flex:1; min-width:0; display:flex; align-items:center; gap:6px; overflow-x:auto; padding:2px 2px 5px; scrollbar-width:thin; }
 .theme-chip { flex:none; min-height:34px; max-width:min(20rem,100%); padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:#f8faf7; text-align:left; cursor:pointer; display:flex; align-items:center; gap:8px; }
@@ -154,7 +157,8 @@ main { min-width:0; }
 .folder-grid .purpose-folder { margin:0; }
 .month-ledger { margin-top:26px; }
 .month-ledger:last-child { min-height:calc(100vh - var(--topbar-height,84px)); }
-.month-heading { position:sticky; top:var(--topbar-height,84px); z-index:3; min-height:44px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px 10px; padding:10px 12px; border-top:1px solid #d4dfd6; border-bottom:1px solid var(--line); background:var(--paper); }
+.month-context { position:sticky; top:var(--topbar-height,84px); z-index:3; background:var(--paper); border-top:1px solid #d4dfd6; border-bottom:1px solid var(--line); }
+.month-heading { min-height:44px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px 10px; padding:10px 12px; }
 .month-heading h2 { font-size:1rem; }
 .month-heading>span { color:var(--muted); font-size:0.75rem; }
 .month-ledger .day-list { margin-top:8px; padding-top:0; }

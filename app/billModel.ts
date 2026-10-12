@@ -274,6 +274,24 @@ export function closestLedgerDate(dates: string[], target: string) {
   return sorted.find((date) => date <= target) ?? sorted.at(-1);
 }
 
+export function monthlyTagThemes(items: Transaction[], groups: PurposeGroup[]) {
+  const months = new Map<string, Map<string, Transaction[]>>();
+  for (const group of groups) {
+    if (!months.has(group.month)) months.set(group.month, new Map());
+    months.get(group.month)!.set(group.name, []);
+  }
+  for (const item of items) {
+    const month = item.date.slice(0, 7);
+    if (!months.has(month)) months.set(month, new Map());
+    const themes = months.get(month)!;
+    for (const name of new Set(item.tags ?? [])) {
+      if (!themes.has(name)) themes.set(name, []);
+      themes.get(name)!.push(item);
+    }
+  }
+  return new Map([...months].map(([month, themes]) => [month, [...themes].sort(([a], [b]) => a.localeCompare(b)).map(([name, records]) => ({ name, count: records.length, total: netExpense(records) }))]));
+}
+
 export function readBook(value: unknown, legacyMonth?: string): { transactions: Transaction[]; groups: PurposeGroup[]; invalid: number; total: number } {
   const document = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
   if (document?.version !== undefined && (typeof document.version !== "number" || document.version > 7)) throw new Error("不支持此 JSON 版本");

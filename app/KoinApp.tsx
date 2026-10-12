@@ -1,7 +1,7 @@
 import { ChangeEvent, DragEvent, FormEvent, MouseEvent, PointerEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
-  CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction,
+  CATEGORY_COLORS, CATEGORIES, STORE_KEY, counts, createBook, displayTransaction, monthlyTagThemes,
   applyMonthlyAccounting, closestLedgerDate, contextTransactionIds, deleteTransaction, detachTransactions, filterTransactions, groupsInRange, groupTransactionsByDay, linkTransactions, mergeGroups, monthEnd, monthlyPaymentSummary, netExpense, planImport, readBook, relatedTransactions, relationIndex, renameMonthlyTag, setCounted, setTags, transactionSources, convertGroupTags,
   type MonthlyAccounting, type ImportPreview, type Kind, type Transaction, type PurposeGroup, type RelationKind,
 } from "./billModel";
@@ -294,7 +294,7 @@ function BillSearch({ query, onSearch }: { query: string; onSearch: (query: stri
 }
 
 function ledgerHeaderOffset(target: HTMLElement, includeDay = false) {
-  const monthHeader = target.closest(".month-ledger")?.querySelector(".month-heading");
+  const monthHeader = target.closest(".month-ledger")?.querySelector(".month-context");
   const dayHeader = includeDay ? target.closest(".day-group")?.querySelector(".day-heading") : null;
   return (document.querySelector(".topbar")?.getBoundingClientRect().height ?? 84) + (monthHeader?.getBoundingClientRect().height ?? 44) + (dayHeader?.getBoundingClientRect().height ?? 0) + 8;
 }
@@ -313,6 +313,8 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const [category, setCategory] = useState(initialFilter.category ?? "");
   const [merchant, setMerchant] = useState(initialFilter.merchant ?? "");
   const [tag, setTag] = useState(initialFilter.tag ?? "");
+  const [monthTags, setMonthTags] = useState<Record<string, string>>({});
+  const [managedTheme, setManagedTheme] = useState({ month: "", name: "" });
   const [source, setSource] = useState("");
   const [scope, setScope] = useState<"month" | "day" | "range" | "all">("all");
   const [start, setStart] = useState(`${month}-01`);
@@ -348,7 +350,6 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const dragPreview = useRef<HTMLDivElement>(null);
   const pointerDrag = useRef<{ ids: string[]; title: string; pointerId: number; x: number; y: number; currentX: number; currentY: number; moved: boolean } | null>(null);
   const timeline = useRef<HTMLDivElement>(null);
-  const themeStrip = useRef<HTMLDivElement>(null);
   const visibleMonth = useRef<string | null>(null);
   const userScrolling = useRef(false);
   const validRange = scope === "range" ? Boolean(start && end && start <= end) : scope !== "day" || Boolean(day);
@@ -361,21 +362,33 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const tags = useMemo(() => [...new Set([...scoped.flatMap((item) => item.tags ?? []), ...visibleGroups.map((group) => group.name)])].sort(), [scoped, visibleGroups]);
   const sources = useMemo(() => [...new Set(scoped.flatMap(transactionSources))].sort(), [scoped]);
   const filtered = useMemo(() => filterTransactions(scoped, { query, category, merchant, source }).filter((item) => !monthlyOnly || monthlyIds.has(item.id)), [scoped, query, category, merchant, source, monthlyOnly, monthlyIds]);
-  const visible = useMemo(() => filtered.filter((item) => !tag || item.tags?.includes(tag)).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id)), [filtered, tag]);
-  const tagSummaries = useMemo(() => {
-    const entries = new Map(tags.map((name) => [name, [] as Transaction[]]));
-    for (const item of filtered) for (const name of item.tags ?? []) entries.get(name)?.push(item);
-    return tags.map((name) => ({ name, count: entries.get(name)!.length, total: netExpense(entries.get(name)!) }));
-  }, [tags, filtered]);
+  const globallyFiltered = useMemo(() => filtered.filter((item) => !tag || item.tags?.includes(tag)), [filtered, tag]);
+  const tagSummaries = useMemo(() => monthlyTagThemes(globallyFiltered, visibleGroups), [globallyFiltered, visibleGroups]);
+  const monthlyRecords = useMemo(() => {
+    const months = new Map<string, Transaction[]>();
+    for (const item of globallyFiltered) {
+      const month = item.date.slice(0, 7);
+      if (!months.has(month)) months.set(month, []);
+      months.get(month)!.push(item);
+    }
+    return months;
+  }, [globallyFiltered]);
+  const visible = useMemo(() => globallyFiltered.filter((item) => {
+    const name = monthTags[item.date.slice(0, 7)];
+    return !name || item.tags?.includes(name);
+  }).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id)), [globallyFiltered, monthTags]);
   const selectedItems = items.filter((item) => selected.has(item.id));
   const themeMonth = groupMonth || (scope === "month" ? month : scope === "day" ? day.slice(0, 7) : scope === "range" ? start.slice(0, 7) : selectedItems[0]?.date.slice(0, 7) || month);
   const allVisibleSelected = visible.length > 0 && visible.every((item) => selected.has(item.id));
-  const timelineMonths = useMemo(() => [...new Set(visible.map((item) => item.date.slice(0, 7)))].sort().reverse(), [visible]);
+  const timelineMonths = useMemo(() => [...monthlyRecords.keys()].sort().reverse(), [monthlyRecords]);
   const firstTimelineMonth = timelineMonths[0];
   const canExclude = selectedItems.some(counts);
   const canRestore = selectedItems.some((item) => !counts(item));
   const filterCount = [source, category, merchant, tag].filter(Boolean).length;
+  const currentTheme = monthTags[month] || tag;
+  const hasMonthFilter = timelineMonths.some((value) => Boolean(monthTags[value]));
   const contextItem = items.find((item) => item.id === contextMenu?.id);
+  const contextTag = (contextItem && monthTags[contextItem.date.slice(0, 7)]) || tag;
   const contextIds = contextItem ? contextTransactionIds(items, selected, contextItem.id) : [];
   const contextRecords = contextIds.map((id) => relations.byId.get(id)!);
   const contextHasCounted = contextRecords.some(counts);
@@ -385,15 +398,18 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
   const dropRecord = relations.byId.get(dropRecordId ?? "");
 
   useLayoutEffect(() => {
-    const strip = themeStrip.current;
-    if (strip && !tag) { strip.scrollLeft = 0; return; }
-    const button = [...(strip?.querySelectorAll<HTMLElement>("[data-tag-name]") ?? [])].find((item) => item.dataset.tagName === tag);
-    if (!strip || !button) return;
-    const bounds = strip.getBoundingClientRect();
-    const rect = button.getBoundingClientRect();
-    const delta = rect.left < bounds.left ? rect.left - bounds.left : rect.right > bounds.right ? rect.right - bounds.right : 0;
-    if (delta) strip.scrollLeft += delta;
-  }, [tag, tags]);
+    for (const ledger of timeline.current?.querySelectorAll<HTMLElement>(".month-ledger") ?? []) {
+      const strip = ledger.querySelector<HTMLElement>(".theme-strip");
+      const name = monthTags[ledger.dataset.month!];
+      if (strip && !name) { strip.scrollLeft = 0; continue; }
+      const button = [...(strip?.querySelectorAll<HTMLElement>("[data-tag-name]") ?? [])].find((item) => item.dataset.tagName === name);
+      if (!strip || !button) continue;
+      const bounds = strip.getBoundingClientRect();
+      const rect = button.getBoundingClientRect();
+      const delta = rect.left < bounds.left ? rect.left - bounds.left : rect.right > bounds.right ? rect.right - bounds.right : 0;
+      if (delta) strip.scrollLeft += delta;
+    }
+  }, [monthTags, tagSummaries]);
 
   useEffect(() => {
     if (!revealId) return;
@@ -414,7 +430,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     let parent = item.parentId ? relations.byId.get(item.parentId) : undefined;
     while (parent) { ancestors.push(parent); parent = parent.parentId ? relations.byId.get(parent.parentId) : undefined; }
     setExpandedRelations((old) => new Set([...old, ...ancestors.map((record) => record.id)]));
-    setQuery(""); setSource(""); setCategory(""); setMerchant(""); setTag(""); setScope("all"); setMonthlyOnly(false);
+    setQuery(""); setSource(""); setCategory(""); setMerchant(""); setTag(""); setMonthTags({}); setScope("all"); setMonthlyOnly(false);
     onMonthVisible(item.date.slice(0, 7));
     setRevealId(id);
   }
@@ -466,7 +482,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
         ledger?.style.setProperty("--ledger-month-height", `${target.getBoundingClientRect().height}px`);
       }
     });
-    for (const header of timeline.current?.querySelectorAll(".month-heading") ?? []) observer.observe(header);
+    for (const header of timeline.current?.querySelectorAll(".month-context") ?? []) observer.observe(header);
     return () => observer.disconnect();
   }, [timelineMonths]);
 
@@ -487,6 +503,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     const located = closestLedgerDate(visible.map((item) => item.date), jumpDate);
     const target = [...(timeline.current?.querySelectorAll<HTMLElement>("[data-date]") ?? [])].find((row) => row.dataset.date === located);
     if (target && located) {
+      userScrolling.current = false;
       const offset = ledgerHeaderOffset(target);
       visibleMonth.current = located.slice(0, 7);
       onMonthVisible(located.slice(0, 7));
@@ -560,6 +577,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     const id = editingGroup ?? crypto.randomUUID();
     onGroupSave({ id, name, month: targetMonth }, editingGroup ? [] : selectedItems.map((item) => item.id));
     if (editingGroup && tag === groups.find((group) => group.id === editingGroup)?.name) setTag(name);
+    if (editingGroup && monthTags[targetMonth] === groups.find((group) => group.id === editingGroup)?.name) setMonthTags((old) => ({ ...old, [targetMonth]: name }));
     setEditingGroup(null); setGroupName(""); setGroupError("");
     setToolPanel(null);
   }
@@ -567,7 +585,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
     const ids = selectedItems.map((item) => item.id);
     if (!ids.length) return;
     if (action.startsWith("tag:")) onTag(ids, action.slice(4));
-    else if (action === "remove-tag" && tag) onTag(ids, tag, true);
+    else if (action === "remove-tag" && currentTheme) onTag(ids, currentTheme, true);
     else if (action === "exclude") onCounted(ids, false);
     else if (action === "restore") onCounted(ids, true);
     else if (action === "monthly") setLinkRequest({ ids, parentId: "", relation: "monthly" });
@@ -645,7 +663,7 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
         {contextHasCounted && <button role="menuitem" onClick={() => { onCounted(contextIds, false); setContextMenu(null); }}>设为不计入</button>}
         {contextHasExcluded && <button role="menuitem" onClick={() => { onCounted(contextIds, true); setContextMenu(null); }}>恢复计入</button>}
         <button role="menuitem" aria-haspopup="menu" disabled={!tags.length} onClick={() => setContextMenu({ ...contextMenu, showGroups: true })}>添加标签 ›</button>
-        {tag && contextRecords.some((item) => item.tags?.includes(tag)) && <button role="menuitem" onClick={() => { onTag(contextIds, tag, true); setContextMenu(null); }}>移除「{tag}」标签</button>}
+        {contextTag && contextRecords.some((item) => item.tags?.includes(contextTag)) && <button role="menuitem" onClick={() => { onTag(contextIds, contextTag, true); setContextMenu(null); }}>移除「{contextTag}」标签</button>}
       </>}
     </div>}
     {linkRequest && <LinkDialog monthlyMode={monthlyMode} items={items} request={linkRequest} onClose={() => setLinkRequest(null)} onLink={(parentId, relation) => { onLink(linkRequest.ids, parentId, relation); setExpandedRelations((old) => new Set([...old, parentId])); setLinkRequest(null); }} />}
@@ -658,10 +676,6 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
         <button className="secondary" aria-expanded={toolPanel === "filters"} aria-controls="detail-filter-options" onClick={() => setToolPanel(toolPanel === "filters" ? null : "filters")}>筛选{filterCount ? " (" + filterCount + ")" : ""}</button><button className="secondary" aria-label="补记一笔" onClick={onAdd}>补记</button>
       </div>
       <div id="detail-filter-options" className="tool-options" hidden={toolPanel !== "filters"}><div className="filters"><select aria-label="筛选来源" value={source} onChange={(event) => setSource(event.target.value)}><option value="">全部来源</option>{sources.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选分类" value={category} onChange={(event) => setCategory(event.target.value)}><option value="">全部分类</option>{categories.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选商家" value={merchant} onChange={(event) => setMerchant(event.target.value)}><option value="">全部商家</option>{merchants.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="筛选标签" value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部标签</option>{tags.map((item) => <option key={item}>{item}</option>)}</select></div></div>
-      <section className="tag-themes" aria-label="标签主题">
-        <strong className="theme-heading" title="点击筛选，拖入账单添加标签">标签</strong>
-        <div className="theme-strip" ref={themeStrip}><button className="theme-chip" aria-pressed={!tag} onClick={() => setTag("")}><strong>全部</strong><span>{filtered.length} 条 · ¥{yuan(netExpense(filtered))}</span></button>{tagSummaries.map((theme) => <button key={theme.name} data-tag-name={theme.name} title={`#${theme.name} · ${theme.count} 条 · 净消费 ¥${yuan(theme.total)}；拖入账单添加标签`} className={"theme-chip" + (dragOver === theme.name ? " drag-over" : "")} aria-pressed={tag === theme.name} onClick={() => setTag(tag === theme.name ? "" : theme.name)} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); setDragOver(theme.name); } }} onDragLeave={() => setDragOver(null)} onDrop={(event) => drop(event, theme.name)}><strong>#{theme.name}</strong><span>{theme.count} · ¥{yuan(theme.total)}</span></button>)}</div>
-      </section>
       <div className="detail-utility">
         <div className="date-tools">
           <select aria-label="查看日期范围" value={scope} onChange={(event) => { setScope(event.target.value as typeof scope); setDateMessage(""); }}><option value="all">连续浏览</option><option value="month">当前月份</option><option value="day">指定日期</option><option value="range">日期范围</option></select>
@@ -670,32 +684,41 @@ function Details({ monthlyMode, items, groups, month, onMonthVisible, initialFil
         </div>
         <div className="tag-tools">
           <button className="secondary" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupMonth(""); setGroupError(""); setToolPanel("group"); }}>＋ 新建标签</button>
-          <button className="secondary" disabled={!tag || !visibleGroups.some((group) => group.name === tag)} onClick={() => setToolPanel("manage")}>管理标签</button>
+          <button className="secondary" disabled={!currentTheme || !visibleGroups.some((group) => group.month === month && group.name === currentTheme)} onClick={() => { setManagedTheme({ month, name: currentTheme }); setToolPanel("manage"); }}>管理标签</button>
         </div>
         <section className="selection-tools" aria-label="勾选与批量操作">
           <div className="selection-total" title="退款扣除，不计入按 0 元；手动计入的还款、转账按支出"><span>已选 {selectedItems.length} 条</span><strong>¥{yuan(netExpense(selectedItems))}</strong></div>
           <select aria-label="批量操作" value="" disabled={!selectedItems.length} onChange={(event) => batchAction(event.target.value)}>
             <option value="">批量操作…</option>
             <optgroup label="添加标签">{tags.map((name) => <option value={`tag:${name}`} key={name}>#{name}</option>)}</optgroup>
-            {tag && <option value="remove-tag">移除当前标签</option>}
+            {currentTheme && <option value="remove-tag">移除当前标签</option>}
             <optgroup label="统计与关联"><option value="monthly" disabled={selectedItems.some((item) => item.kind === "income")}>归入月付…</option><option value="exclude" disabled={!canExclude}>设为不计入</option><option value="restore" disabled={!canRestore}>恢复计入</option></optgroup>
             <option value="clear">清空勾选</option>
           </select>
           <button className="secondary" disabled={!visible.length} onClick={toggleVisible}>{allVisibleSelected ? "取消当前全选" : "勾选当前结果"}</button>
         </section>
       </div>
-      <div className="filter-summary"><span title={query ? `搜索条件：${query}` : undefined}>{monthlyOnly ? "月付账单 · " : ""}{visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span>{(query || filterCount > 0) && <button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); }}>清除筛选</button>}{!validRange && <span role="alert">请选择有效的日期范围</span>}{dateMessage && <span role="status">{dateMessage}</span>}</div>
+      <div className="filter-summary"><span title={query ? `搜索条件：${query}` : undefined}>{monthlyOnly ? "月付账单 · " : ""}{visible.length} 条 · 净消费 ¥{yuan(netExpense(visible))}</span>{(query || filterCount > 0 || hasMonthFilter) && <button onClick={() => { setQuery(""); setCategory(""); setMerchant(""); setTag(""); setSource(""); setMonthTags({}); }}>清除筛选</button>}{!validRange && <span role="alert">请选择有效的日期范围</span>}{dateMessage && <span role="status">{dateMessage}</span>}</div>
     </section>
     {toolPanel === "group" && <Modal title={editingGroup ? "标签改名" : "新建标签"} onClose={() => setToolPanel(null)}><form className="editor-form" onSubmit={saveGroup}>{!editingGroup && <label>主题月份<input aria-label="标签主题月份" type="month" value={themeMonth} onInput={(event) => setGroupMonth(event.currentTarget.value)} onChange={(event) => setGroupMonth(event.target.value)} /></label>}<label>标签名称<input aria-label="标签名称" maxLength={80} placeholder="例如：厨具购买" value={groupName} onChange={(event) => { setGroupName(event.target.value); setGroupError(""); }} /></label><p className="group-hint">{selectedItems.length && !editingGroup ? `创建后标记已选的 ${selectedItems.length} 条账单；` : ""}账单保留在日期列表，一笔可有多个标签。</p>{groupError && <p className="import-error" role="alert">{groupError}</p>}<div className="modal-actions"><button className="secondary" type="button" onClick={() => setToolPanel(null)}>取消</button><button className="primary" type="submit">{editingGroup ? "保存名称" : selectedItems.length ? "创建并标记已选" : "创建标签"}</button></div></form></Modal>}
-    {toolPanel === "manage" && <Modal title="管理标签" onClose={() => setToolPanel(null)}><div className="theme-manager"><strong>#{tag}</strong><p className="group-hint">按月管理主题；改名或移除只影响对应月份的同名标签，账单会保留。</p>{visibleGroups.filter((group) => group.name === tag).map((group) => <div className="theme-management" key={group.id}><span>{formatMonth(group.month)}</span><button className="secondary" onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); setToolPanel("group"); }}>改名</button><button className="secondary" onClick={() => onGroupDelete(group.id)}>删除标签</button></div>)}</div></Modal>}
+    {toolPanel === "manage" && <Modal title="管理标签" onClose={() => setToolPanel(null)}><div className="theme-manager"><strong>#{managedTheme.name}</strong><p className="group-hint">按月管理主题；改名或移除只影响对应月份的同名标签，账单会保留。</p>{visibleGroups.filter((group) => group.name === managedTheme.name && group.month === managedTheme.month).map((group) => <div className="theme-management" key={group.id}><span>{formatMonth(group.month)}</span><button className="secondary" onClick={() => { setEditingGroup(group.id); setGroupName(group.name); setGroupError(""); setToolPanel("group"); }}>改名</button><button className="secondary" onClick={() => onGroupDelete(group.id)}>删除标签</button></div>)}</div></Modal>}
     {visible.length > 0 && <span className="screen-reader-only" aria-label="当前浏览日期">{activeDate || visible[0].date}</span>}
     <div className="bill-timeline" ref={timeline}>{timelineMonths.map((timelineMonth) => {
-      const monthly = visible.filter((item) => item.date.startsWith(timelineMonth));
+      const allMonthly = monthlyRecords.get(timelineMonth) ?? [];
+      const monthlyTag = monthTags[timelineMonth] ?? "";
+      const monthly = allMonthly.filter((item) => !monthlyTag || item.tags?.includes(monthlyTag)).sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id));
       return <section className="month-ledger" key={timelineMonth} data-month={timelineMonth} aria-label={formatMonth(timelineMonth) + "账单"}>
-        <div className="month-heading"><h2>{formatMonth(timelineMonth)}</h2><span>{monthly.length} 笔 · 净消费 ¥{yuan(netExpense(monthly))}</span></div>
-        <section className="panel day-list"><BillRows records={monthly} {...rowProps} /></section>
+        <div className="month-context">
+          <div className="month-heading"><h2>{formatMonth(timelineMonth)}</h2><span>{monthly.length} 笔 · 净消费 ¥{yuan(netExpense(monthly))}</span></div>
+          <section className="tag-themes" aria-label={formatMonth(timelineMonth) + "标签"}>
+            <div className="theme-strip"><button className="theme-chip" aria-pressed={!monthlyTag} onClick={() => setMonthTags((old) => ({ ...old, [timelineMonth]: "" }))}><strong>全部</strong><span>{allMonthly.length} 条 · ¥{yuan(netExpense(allMonthly))}</span></button>{(tagSummaries.get(timelineMonth) ?? []).map((theme) => <button key={theme.name} data-tag-name={theme.name} title={`#${theme.name} · ${theme.count} 条 · 净消费 ¥${yuan(theme.total)}；只筛选本月，拖入账单添加标签`} className={"theme-chip" + (dragOver === theme.name ? " drag-over" : "")} aria-pressed={monthlyTag === theme.name} onClick={() => setMonthTags((old) => ({ ...old, [timelineMonth]: monthlyTag === theme.name ? "" : theme.name }))} onDragOver={(event) => { if (event.dataTransfer.types.includes("application/x-koin-transactions")) { event.preventDefault(); setDragOver(theme.name); } }} onDragLeave={() => setDragOver(null)} onDrop={(event) => drop(event, theme.name)}><strong>#{theme.name}</strong><span>{theme.count} · ¥{yuan(theme.total)}</span></button>)}</div>
+            <button className="month-tag-action" aria-label={formatMonth(timelineMonth) + "新建标签"} title="在这个月新建标签" onClick={() => { setEditingGroup(null); setGroupName(""); setGroupMonth(timelineMonth); setGroupError(""); setToolPanel("group"); }}>＋</button>
+            {monthlyTag && visibleGroups.some((group) => group.month === timelineMonth && group.name === monthlyTag) && <button className="month-tag-action" aria-label={formatMonth(timelineMonth) + "管理标签"} title="管理选中的本月标签" onClick={() => { setManagedTheme({ month: timelineMonth, name: monthlyTag }); setToolPanel("manage"); }}>⋯</button>}
+          </section>
+        </div>
+        <section className="panel day-list">{monthly.length ? <BillRows records={monthly} {...rowProps} /> : <p className="month-empty">这个月没有匹配的账单，点击“全部”查看。</p>}</section>
       </section>;
-    })}{!visible.length && <section className="panel empty-state"><h2>当前没有匹配账单</h2><p>调整日期、标签或搜索条件后查看。</p></section>}</div>
+    })}{!timelineMonths.length && <section className="panel empty-state"><h2>当前没有匹配账单</h2><p>调整日期、标签或搜索条件后查看。</p></section>}</div>
   </div>;
 }
 type BillRowActions = {
